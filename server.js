@@ -9,75 +9,74 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Configuración de conexión DB
+// Configuración de conexión DB Robustecida para Railway
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-  connectionTimeoutMillis: 5000,
+  connectionTimeoutMillis: 10000, // Aumentamos timeout a 10s
 });
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// --- INICIALIZACIÓN DE LA BASE DE DATOS ---
-// Esta función se ejecuta al arrancar. Si la DB está vacía, crea las tablas.
+// --- FUNCIÓN DE INICIALIZACIÓN DE TABLAS ---
+const createTablesSQL = `
+  -- TABLA 1: LIBRO DE PEDIDOS
+  CREATE TABLE IF NOT EXISTS orders (
+    id SERIAL PRIMARY KEY,
+    agent_code TEXT,
+    agent_name TEXT,
+    product_code TEXT,
+    product_name TEXT,
+    quantity NUMERIC DEFAULT 0,
+    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(received_at);
+
+  -- TABLA 2: ALMACÉN
+  CREATE TABLE IF NOT EXISTS inventory (
+    product_code TEXT PRIMARY KEY,
+    stock_qty NUMERIC DEFAULT 0
+  );
+  
+  -- TABLA 3: EL PORTERO (Anti-Duplicados)
+  CREATE TABLE IF NOT EXISTS webhook_memory (
+    line_hash TEXT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_memory_date ON webhook_memory(created_at);
+`;
+
 const initDB = async () => {
   if (!process.env.DATABASE_URL) {
-    console.log('⚠️ [SYSTEM] Running without Database Connection (Memory Mode - Data will not persist)');
+    console.log('⚠️ [SYSTEM] Running in MEMORY MODE (No Database URL found)');
     return;
   }
+  
+  console.log('🔄 [DB] Intentando conectar a PostgreSQL...');
+  let client;
   try {
-    const client = await pool.connect();
-    try {
-      console.log('🔄 [DB] Verificando estructura de tablas...');
-      
-      // 1. Limpieza de tablas antiguas o basura (Legacy)
-      await client.query('DROP TABLE IF EXISTS daily_stats'); 
-      await client.query('DROP TABLE IF EXISTS "DALL·E STATS"'); 
+    client = await pool.connect();
+    console.log('✅ [DB] Conexión establecida. Verificando tablas...');
+    
+    // Limpieza de legacy
+    await client.query('DROP TABLE IF EXISTS daily_stats'); 
+    await client.query('DROP TABLE IF EXISTS "DALL·E STATS"'); 
 
-      // 2. Creación de tablas Core (Si no existen, se crean)
-      await client.query(`
-        -- TABLA 1: LIBRO DE PEDIDOS (La Realidad)
-        -- Guarda cada línea de pedido recibida con fecha y hora.
-        CREATE TABLE IF NOT EXISTS orders (
-          id SERIAL PRIMARY KEY,
-          agent_code TEXT,
-          agent_name TEXT,
-          product_code TEXT,
-          product_name TEXT,
-          quantity NUMERIC DEFAULT 0,
-          received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        -- Índice para agilizar las consultas por fecha (Analítica)
-        CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(received_at);
-
-        -- TABLA 2: ALMACÉN (El Escáner)
-        -- Guarda el stock físico actual.
-        CREATE TABLE IF NOT EXISTS inventory (
-          product_code TEXT PRIMARY KEY,
-          stock_qty NUMERIC DEFAULT 0
-        );
-        
-        -- TABLA 3: EL PORTERO (Memoria de Duplicados)
-        -- Imprescindible para evitar duplicados si Make reintenta el envío.
-        CREATE TABLE IF NOT EXISTS webhook_memory (
-          line_hash TEXT PRIMARY KEY,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        -- Índice para limpieza automática (si se decidiera implementar en el futuro)
-        CREATE INDEX IF NOT EXISTS idx_memory_date ON webhook_memory(created_at);
-      `);
-      console.log('✅ [DB] Base de Datos lista y estructurada: orders, inventory, webhook_memory');
-    } finally {
-      client.release();
-    }
-  } catch (err) { console.error('❌ [DB] Error de Conexión/Inicialización:', err.message); }
+    // Creación
+    await client.query(createTablesSQL);
+    console.log('✅ [DB] Tablas verificadas/creadas correctamente: orders, inventory, webhook_memory');
+  } catch (err) { 
+    console.error('❌ [DB CRITICAL ERROR] No se pudieron crear las tablas:', err.message); 
+  } finally {
+    if (client) client.release();
+  }
 };
 
-// Ejecutamos la inicialización
+// Ejecutamos al inicio
 initDB();
 
-// --- SSE SYSTEM (Eventos en tiempo real) ---
+// --- SSE SYSTEM ---
 let clients = [];
 
 app.get('/api/events', (req, res) => {
@@ -107,6 +106,35 @@ const notifyClients = (updatedCode, type = 'update') => {
 
 // --- API ENDPOINTS ---
 
+// ENDPOINT DE DIAGNÓSTICO (Nuevo)
+// Permite al usuario forzar la creación de tablas desde el navegador si falló el inicio automático
+app.get('/api/test-db', async (req, res) => {
+  if (!process.env.DATABASE_URL) {
+    return res.status(500).send("ERROR: Variable DATABASE_URL no encontrada en Railway.");
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query(createTablesSQL);
+    res.send(`
+      <h1>Diagnóstico de Base de Datos</h1>
+      <p style="color: green; font-weight: bold;">✅ ÉXITO: Conexión establecida.</p>
+      <p>Las tablas (orders, inventory, webhook_memory) han sido verificadas/creadas.</p>
+      <p>Ya puedes enviar datos desde Make.</p>
+    `);
+  } catch (err) {
+    res.status(500).send(`
+      <h1>Error de Base de Datos</h1>
+      <p style="color: red; font-weight: bold;">❌ ERROR: ${err.message}</p>
+      <pre>${JSON.stringify(err, null, 2)}</pre>
+      <p>Verifica que la variable DATABASE_URL en Railway sea correcta (comienza por postgres://...)</p>
+    `);
+  } finally {
+    if (client) client.release();
+  }
+});
+
 app.post('/api/webhook', async (req, res) => {
   const { zonas } = req.body;
   
@@ -128,11 +156,8 @@ app.post('/api/webhook', async (req, res) => {
     let countInsert = 0;
     let countSkipped = 0;
     
-    // TRUCO: Usamos una fecha "fija" por día basada en UTC para evitar errores de zona horaria
     const now = new Date();
     const todayHashStr = `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}`;
-
-    // Mapa para contar ocurrencias DENTRO de este mismo envío (ej: 2 filas iguales de Burrata)
     const batchOccurrences = new Map();
 
     for (const z of zonas) {
@@ -143,30 +168,20 @@ app.post('/api/webhook', async (req, res) => {
       if (z.productos && Array.isArray(z.productos)) {
         for (const p of z.productos) {
           lastCode = String(p.codigo || 'UNKNOWN').toUpperCase().trim();
-          
-          // --- LOGICA DE REDONDEO ESTRICTO (SOLICITUD V4) ---
           const qty = Math.floor(Number(p.cantidad) || 0); 
-          
           const finalProductName = p.nombre || topLevelProductName;
 
           if (qty > 0) {
-            // 1. Identificar si es la 1ª, 2ª o 3ª vez que aparece ESTE producto idéntico en el array
             const occurrenceKey = `${code}-${lastCode}-${qty}`;
             const currentCount = (batchOccurrences.get(occurrenceKey) || 0) + 1;
             batchOccurrences.set(occurrenceKey, currentCount);
 
-            // 2. Crear HUELLA DIGITAL (Hash)
-            // Agente + Producto + Cantidad + FechaUTC + Nº Ocurrencia
             const rawString = `${code}-${lastCode}-${qty}-${todayHashStr}-${currentCount}`;
             const lineHash = crypto.createHash('md5').update(rawString).digest('hex');
 
-            // 3. Preguntar al Portero (Memoria)
             const checkMem = await client.query('SELECT 1 FROM webhook_memory WHERE line_hash = $1', [lineHash]);
 
             if (checkMem.rows.length === 0) {
-              // -> NO ESTÁ EN MEMORIA. Es nuevo.
-              
-              // Verificación extra de seguridad (Doble Check contra Orders real)
               const checkDB = await client.query(
                 `SELECT COUNT(*) as cnt FROM orders 
                  WHERE agent_code = $1 
@@ -179,22 +194,18 @@ app.post('/api/webhook', async (req, res) => {
               const existingInDB = parseInt(checkDB.rows[0].cnt || '0', 10);
 
               if (existingInDB >= currentCount) {
-                 // YA ESTÁ EN ORDERS. Solo actualizamos la memoria para que no vuelva a molestar.
                  await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1) ON CONFLICT DO NOTHING', [lineHash]);
                  countSkipped++;
               } else {
-                 // NO ESTÁ EN ORDERS. Insertamos de verdad.
                  await client.query(
                   `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity) 
                    VALUES ($1, $2, $3, $4, $5)`,
                   [code, name, lastCode, finalProductName, qty]
                  );
-                 // Y guardamos la huella
                  await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1)', [lineHash]);
                  countInsert++;
               }
             } else {
-              // -> YA ESTÁ EN MEMORIA.
               countSkipped++;
             }
           }
@@ -219,7 +230,6 @@ app.post('/api/webhook', async (req, res) => {
 
 app.post('/api/scan', async (req, res) => {
   const authHeader = req.headers.authorization;
-  // Credencial V4 Nueva
   if (!authHeader || authHeader !== 'Bearer DASHBOARD_V4_KEY_2026') {
     return res.status(401).json({ error: 'Unauthorized' });
   }
