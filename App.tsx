@@ -5,6 +5,7 @@ import { ClientColumn } from './components/ClientColumn';
 import { StatsDashboard } from './components/StatsDashboard';
 import { SettingsModal } from './components/SettingsModal';
 import { DEFAULT_SETTINGS, CLIENT_MAPPING } from './types';
+import { PRODUCT_UNITS } from './constants';
 
 export default function App() {
   const [view, setView] = useState<'live' | 'stats'>('live');
@@ -47,7 +48,13 @@ export default function App() {
 
           // Normalizar código
           const rawCode = String(row.agent_code ?? '').trim();
+          const pCodeRaw = String(row.product_code ?? '').trim().toUpperCase();
           
+          // --- LÓGICA DE CONVERSIÓN DE UNIDADES (PIEZAS) ---
+          // Buscamos si el producto tiene un multiplicador definido (Ej: BUR11 -> 30)
+          // Si no existe, usamos 1 (mantenemos la cantidad original)
+          const multiplier = PRODUCT_UNITS[pCodeRaw] || 1;
+
           // Mapeo de Cliente (Gran Canaria agrupa 10, 14, 5, 0, 8)
           const clientName = CLIENT_MAPPING[rawCode] || row.agent_name || `ZONA ${rawCode}`;
           
@@ -60,19 +67,21 @@ export default function App() {
             };
           }
           
-          // Guardar Stock Global
-          const pCode = row.product_code;
-          const stock = Number(row.global_stock);
-          globalStockMap.set(pCode, stock);
+          // Guardar Stock Global (También aplicamos multiplicador al stock si se cuenta en cajas pero queremos ver piezas)
+          // Asumimos que el scanner lee códigos de barras de la caja (bulto)
+          const stockRaw = Number(row.global_stock);
+          const stockPieces = stockRaw * multiplier;
+          globalStockMap.set(row.product_code, stockPieces);
 
-          const qtyToday = Number(row.total_qty);
-          const qtyYesterday = Number(row.yesterday_qty);
+          // Cantidades Multiplicadas
+          const qtyToday = Number(row.total_qty) * multiplier;
+          const qtyYesterday = Number(row.yesterday_qty) * multiplier;
 
           // Buscar si el producto ya existe en este cliente (para agrupar códigos de agente)
           const existingProd = groups[clientName].products.find((p: any) => p.code === row.product_code);
           
           if (existingProd) {
-             // SUMA SIMPLE (Sin calcular % todavía)
+             // SUMA SIMPLE
              existingProd.qty += qtyToday;
              existingProd.yesterdayQty += qtyYesterday;
           } else {
