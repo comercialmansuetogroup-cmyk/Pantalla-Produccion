@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 
 // --- VERSION TAG ---
 console.log('----------------------------------------------------');
-console.log('🚀 [SYSTEM] INICIANDO VERSION 3.1 - LÓGICA DE UNIDADES EN BACKEND');
+console.log('🚀 [SYSTEM] INICIANDO VERSION 3.5 - HASH EN ORDERS TABLE');
 console.log('----------------------------------------------------');
 
 // Configuración de conexión DB Robustecida para Railway
@@ -24,23 +24,13 @@ const pool = new Pool({
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// --- TABLA MAESTRA DE CONVERSIÓN (BULTOS -> PIEZAS) ---
-// Esta es la fuente de verdad. Si Make manda 1 caja de BUR11, guardamos 30 unidades.
+// =================================================================================
+// 📍 ZONA 1: LISTA DE PRODUCTOS Y SUS UNIDADES POR CAJA
+// =================================================================================
 const PRODUCT_PACK_SIZE = {
-  'BUR11': 30,  // BURRATA VASO 80GR (BANDEJA 30 PIEZAS)
-  'BUR13': 40,  // BURRATA VASO 60g (BANDEJA 40 PIEZAS)
-  'BUR4': 2,    // BURRATA 125 GR TARRINA 250 GR 2 PIEZAS
-  'BUR5': 8,    // BURRATA 125 GR BANDEJA DE 1 KG 8 PIEZAS
-  'BUR6': 3,    // BURRATA 100 GR TARRINA 300 GR 3 PIEZAS
-  'BUR7': 10,   // BURRATA 100 GR BANDEJA DE 1 KG 10 PIEZAS
-  'MOZ28': 8,   // SCAMORZA IN ACQUA 3.4 - 8 PIEZAS
-  'MOZ30': 9,   // MOZZARELLA BOLA SECA
-  'MOZ5': 12,   // MOZZARELLA FIORDILATTE BANDEJA 3.2
-  'RIC3': 6,    // RICOTTA FRESCA 350 GR BANDEJA 6 PIEZAS
-  'MOZ6': 9,    // MOZZARELLA FIORDILATTE BANDEJA 3.8
-  'MOH1': 9,    // MOZ FIORDILAT AHUMADA BANDEJA 3.8
-  'MOZ8': 10,   // MOZZARELLA FIORDILATTE SECA BANDEJA 4 KG
-  'MOH10': 3    // MOZZARELLA FIORDILATTR AHUMADA BANDEJA1.2
+  'BUR11': 30,  'BUR13': 40,  'BUR4': 2,    'BUR5': 8,    'BUR6': 3,    
+  'BUR7': 10,   'MOZ28': 8,   'MOZ30': 9,   'MOZ5': 12,   'RIC3': 6,    
+  'MOZ6': 9,    'MOH1': 9,    'MOZ8': 10,   'MOH10': 3    
 };
 
 // --- FUNCIÓN DE INICIALIZACIÓN DE TABLAS ---
@@ -52,20 +42,16 @@ const createTablesSQL = `
     product_code TEXT,
     product_name TEXT,
     quantity NUMERIC DEFAULT 0,
-    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    unique_hash TEXT UNIQUE
   );
   CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(received_at);
+  CREATE INDEX IF NOT EXISTS idx_orders_hash ON orders(unique_hash);
 
   CREATE TABLE IF NOT EXISTS inventory (
     product_code TEXT PRIMARY KEY,
     stock_qty NUMERIC DEFAULT 0
   );
-  
-  CREATE TABLE IF NOT EXISTS webhook_memory (
-    line_hash TEXT PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE INDEX IF NOT EXISTS idx_memory_date ON webhook_memory(created_at);
 `;
 
 const initDB = async () => {
@@ -78,9 +64,23 @@ const initDB = async () => {
   let client;
   try {
     client = await pool.connect();
+    
+    // MIGRACIÓN: Asegurar que existe la columna unique_hash
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='unique_hash') THEN 
+          ALTER TABLE orders ADD COLUMN unique_hash TEXT UNIQUE; 
+        END IF; 
+      END $$;
+    `);
+
     // Limpieza de legacy
     await client.query('DROP TABLE IF EXISTS daily_stats'); 
     await client.query('DROP TABLE IF EXISTS "DALL·E STATS"'); 
+    // Ya no necesitamos webhook_memory, usamos la columna en orders
+    await client.query('DROP TABLE IF EXISTS webhook_memory'); 
+    
     await client.query(createTablesSQL);
     console.log('✅ [DB] Tablas verificadas correctamente.');
   } catch (err) { 
@@ -127,7 +127,7 @@ app.get('/api/test-db', async (req, res) => {
   try {
     client = await pool.connect();
     await client.query(createTablesSQL);
-    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.1</h1><p>Lógica de multiplicación de unidades activa en servidor.</p>`);
+    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.5</h1><p>Sistema Hash Integrado en Orders.</p>`);
   } catch (err) {
     res.status(500).send(`<h1 style="color:red">❌ ERROR</h1><pre>${err.message}</pre>`);
   } finally {
@@ -157,7 +157,8 @@ app.post('/api/webhook', async (req, res) => {
     let countSkipped = 0;
     
     const now = new Date();
-    const todayHashStr = `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}`;
+    // Usamos fecha local para el hash del día
+    const todayHashStr = now.toISOString().split('T')[0]; 
     const batchOccurrences = new Map();
 
     for (const z of zonas) {
@@ -167,65 +168,50 @@ app.post('/api/webhook', async (req, res) => {
 
       if (z.productos && Array.isArray(z.productos)) {
         for (const p of z.productos) {
-          // Normalización estricta del código de producto
-          const rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase().trim();
-          const finalProductName = p.nombre || topLevelProductName;
           
-          let rawQty = Math.floor(Number(p.cantidad) || 0);
+          // --- LIMPIEZA DE CÓDIGO ---
+          let rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase();
+          rawProductCode = rawProductCode.replace(/^#/, '').replace(/\s+/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+          
+          const finalProductName = p.nombre || topLevelProductName;
+          let rawQtyBoxes = Math.floor(Number(p.cantidad) || 0);
 
-          if (rawQty > 0) {
-            // --- LÓGICA CORE: MULTIPLICACIÓN DE UNIDADES ---
-            // Si el código está en nuestra lista de packs, multiplicamos.
-            // Si no está, asumimos que es 1 unidad por defecto.
+          if (rawQtyBoxes > 0) {
+            
+            // --- CONVERSIÓN ---
             const packSize = PRODUCT_PACK_SIZE[rawProductCode] || 1;
-            const finalQtyUnits = rawQty * packSize;
+            const finalQtyUnits = rawQtyBoxes * packSize;
 
             lastCode = rawProductCode;
 
-            // Generación de Hash Anti-Duplicados
-            // Usamos rawQty en el hash para distinguir si llega otro pedido con distinta cantidad original
-            const occurrenceKey = `${agentCode}-${rawProductCode}-${rawQty}`;
+            // --- LÓGICA ANTI-DUPLICADOS ---
+            // Generamos una clave única para este producto en este payload
+            const occurrenceKey = `${agentCode}-${rawProductCode}-${rawQtyBoxes}`;
             const currentCount = (batchOccurrences.get(occurrenceKey) || 0) + 1;
             batchOccurrences.set(occurrenceKey, currentCount);
 
-            const rawString = `${agentCode}-${rawProductCode}-${rawQty}-${todayHashStr}-${currentCount}`;
-            const lineHash = crypto.createHash('md5').update(rawString).digest('hex');
+            // EL HASH ÚNICO SE GUARDA EN LA COLUMNA 'unique_hash' DE LA TABLA ORDERS
+            const rawString = `${agentCode}-${rawProductCode}-${rawQtyBoxes}-${todayHashStr}-${currentCount}`;
+            const uniqueHash = crypto.createHash('md5').update(rawString).digest('hex');
 
-            const checkMem = await client.query('SELECT 1 FROM webhook_memory WHERE line_hash = $1', [lineHash]);
+            // INTENTO DE INSERCIÓN
+            // Si el hash ya existe (porque Make se ejecutó dos veces con los mismos datos), 
+            // la base de datos rechazará la inserción silenciosamente (DO NOTHING)
+            const result = await client.query(
+              `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity, unique_hash) 
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (unique_hash) DO NOTHING
+               RETURNING id`,
+              [agentCode, agentName, rawProductCode, finalProductName, finalQtyUnits, uniqueHash]
+            );
 
-            if (checkMem.rows.length === 0) {
-              // Verificación doble en DB por si reiniciaron el server
-              const checkDB = await client.query(
-                `SELECT COUNT(*) as cnt FROM orders 
-                 WHERE agent_code = $1 
-                 AND product_code = $2 
-                 AND quantity = $3 
-                 AND received_at >= CURRENT_DATE`, 
-                [agentCode, rawProductCode, finalQtyUnits] // Buscamos por la cantidad convertida
-              );
-              
-              const existingInDB = parseInt(checkDB.rows[0].cnt || '0', 10);
-
-              if (existingInDB >= currentCount) {
-                 await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1) ON CONFLICT DO NOTHING', [lineHash]);
-                 countSkipped++;
-              } else {
-                 // INSERTAMOS LA CANTIDAD YA MULTIPLICADA (finalQtyUnits)
-                 await client.query(
-                  `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity) 
-                   VALUES ($1, $2, $3, $4, $5)`,
-                  [agentCode, agentName, rawProductCode, finalProductName, finalQtyUnits]
-                 );
-                 await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1)', [lineHash]);
-                 countInsert++;
-                 
-                 // Log de verificación para consola
-                 if (packSize > 1) {
-                    console.log(`📦 [PACK DETECTED] ${rawProductCode}: Entrada ${rawQty} cajas -> Guardado ${finalQtyUnits} unidades.`);
-                 }
+            if (result.rows.length > 0) {
+              countInsert++;
+              if (packSize > 1) {
+                 console.log(`📦 [NEW] ${rawProductCode} | Pack: ${packSize} | In: ${rawQtyBoxes} -> Save: ${finalQtyUnits}`);
               }
             } else {
-              countSkipped++;
+              countSkipped++; // Ya existía el hash
             }
           }
         }
@@ -233,7 +219,7 @@ app.post('/api/webhook', async (req, res) => {
     }
 
     await client.query('COMMIT');
-    console.log(`✅ [SYNC] Procesado. Insertados: ${countInsert} | Omitidos: ${countSkipped}`);
+    console.log(`✅ [SYNC] Procesado. Insertados: ${countInsert} | Duplicados Evitados: ${countSkipped}`);
     
     notifyClients(lastCode, 'order');
     res.json({ ok: true, inserted: countInsert, skipped: countSkipped });
@@ -261,11 +247,8 @@ app.post('/api/scan', async (req, res) => {
   const client = await pool.connect();
   try {
     const qtyNum = Number(cantidad);
-    const codeStr = String(codigo).toUpperCase().trim();
+    let codeStr = String(codigo).toUpperCase().replace(/^#/, '').replace(/\s+/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '');
 
-    // NOTA: Asumimos que el scan pistola ya cuenta unidades o cajas según convenga al operario.
-    // Si se necesitara multiplicar aquí también, se usaría PRODUCT_PACK_SIZE[codeStr]
-    
     await client.query(
       `INSERT INTO inventory (product_code, stock_qty) 
        VALUES ($1, $2)
@@ -286,13 +269,9 @@ app.post('/api/scan', async (req, res) => {
 
 app.get('/api/data', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.json([]);
-  
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
   
   try {
-    // La consulta es idéntica, pero ahora 'quantity' ya contiene las PIEZAS REALES.
     const result = await pool.query(`
       WITH RankedDates AS (
         SELECT DISTINCT received_at::DATE as r_date
@@ -326,7 +305,6 @@ app.get('/api/data', async (req, res) => {
   }
 });
 
-// ... resto de endpoints iguales (history, reset) ...
 app.get('/api/history', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.json([]);
   const { period } = req.query; 
@@ -352,22 +330,9 @@ app.get('/api/history', async (req, res) => {
       LIMIT $3
     `;
     const result = await pool.query(query, [truncType, interval, limit]);
-    
     const formatted = result.rows.map(row => {
       const d = new Date(row.date_period);
-      let label = '';
-      if (period === 'week') {
-         const onejan = new Date(d.getFullYear(), 0, 1);
-         const weekNum = Math.ceil((((d.getTime() - onejan.getTime()) / 86400000) + onejan.getDay() + 1) / 7);
-         label = `S${weekNum}`;
-      } else if (period === 'month') {
-         label = d.toLocaleDateString('es-ES', { month: 'short' }).toUpperCase();
-      } else if (period === 'quarter') {
-         const q = Math.floor((d.getMonth() + 3) / 3);
-         label = `Q${q} ${d.getFullYear().toString().substr(-2)}`;
-      } else {
-         label = d.getFullYear().toString();
-      }
+      let label = period === 'month' ? d.toLocaleDateString('es-ES', { month: 'short' }).toUpperCase() : d.getFullYear().toString();
       return { date: label, fullDate: row.date_period, produccion: Number(row.total_qty) };
     });
     res.json(formatted);
@@ -378,15 +343,14 @@ app.get('/api/history', async (req, res) => {
 
 app.post('/api/reset', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.json({ ok: true });
-  
   const client = await pool.connect();
   try {
-    await client.query('TRUNCATE TABLE orders, inventory, webhook_memory RESTART IDENTITY CASCADE');
+    // TRUNCATE RESTART IDENTITY borra todo y resetea contadores
+    await client.query('TRUNCATE TABLE orders, inventory RESTART IDENTITY CASCADE');
     console.log('⚠️ [RESET] SYSTEM FACTORY RESET EXECUTED');
     notifyClients('RESET');
     res.json({ ok: true });
   } catch (err) { 
-    console.error('Reset Error:', err);
     res.status(500).json({ error: err.message }); 
   } finally {
     client.release();
