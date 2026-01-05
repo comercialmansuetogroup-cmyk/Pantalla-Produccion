@@ -9,6 +9,11 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// --- VERSION TAG (Para verificar deploy en logs) ---
+console.log('----------------------------------------------------');
+console.log('🚀 [SYSTEM] INICIANDO VERSION 3.0 - REVISIÓN DE TABLAS');
+console.log('----------------------------------------------------');
+
 // Configuración de conexión DB Robustecida para Railway
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -53,11 +58,11 @@ const initDB = async () => {
     return;
   }
   
-  console.log('🔄 [DB] Intentando conectar a PostgreSQL...');
+  console.log('🔄 [DB] Intentando conectar a PostgreSQL para verificar tablas...');
   let client;
   try {
     client = await pool.connect();
-    console.log('✅ [DB] Conexión establecida. Verificando tablas...');
+    console.log('✅ [DB] Conexión establecida.');
     
     // Limpieza de legacy
     await client.query('DROP TABLE IF EXISTS daily_stats'); 
@@ -65,9 +70,9 @@ const initDB = async () => {
 
     // Creación
     await client.query(createTablesSQL);
-    console.log('✅ [DB] Tablas verificadas/creadas correctamente: orders, inventory, webhook_memory');
+    console.log('✅ [DB] ESTRUCTURA OK: Tablas (orders, inventory, webhook_memory) listas.');
   } catch (err) { 
-    console.error('❌ [DB CRITICAL ERROR] No se pudieron crear las tablas:', err.message); 
+    console.error('❌ [DB CRITICAL ERROR] Fallo al crear tablas:', err.message); 
   } finally {
     if (client) client.release();
   }
@@ -106,8 +111,7 @@ const notifyClients = (updatedCode, type = 'update') => {
 
 // --- API ENDPOINTS ---
 
-// ENDPOINT DE DIAGNÓSTICO (Nuevo)
-// Permite al usuario forzar la creación de tablas desde el navegador si falló el inicio automático
+// ENDPOINT DE DIAGNÓSTICO
 app.get('/api/test-db', async (req, res) => {
   if (!process.env.DATABASE_URL) {
     return res.status(500).send("ERROR: Variable DATABASE_URL no encontrada en Railway.");
@@ -118,17 +122,21 @@ app.get('/api/test-db', async (req, res) => {
     client = await pool.connect();
     await client.query(createTablesSQL);
     res.send(`
-      <h1>Diagnóstico de Base de Datos</h1>
-      <p style="color: green; font-weight: bold;">✅ ÉXITO: Conexión establecida.</p>
-      <p>Las tablas (orders, inventory, webhook_memory) han sido verificadas/creadas.</p>
-      <p>Ya puedes enviar datos desde Make.</p>
+      <div style="font-family: sans-serif; padding: 20px;">
+        <h1 style="color: green;">✅ CONEXIÓN EXITOSA</h1>
+        <p>Estás conectado a la Base de Datos correctamente.</p>
+        <p>Las tablas <strong>orders, inventory, webhook_memory</strong> han sido verificadas.</p>
+        <hr>
+        <p>Versión del Sistema: <strong>3.0</strong></p>
+      </div>
     `);
   } catch (err) {
     res.status(500).send(`
-      <h1>Error de Base de Datos</h1>
-      <p style="color: red; font-weight: bold;">❌ ERROR: ${err.message}</p>
-      <pre>${JSON.stringify(err, null, 2)}</pre>
-      <p>Verifica que la variable DATABASE_URL en Railway sea correcta (comienza por postgres://...)</p>
+      <div style="font-family: sans-serif; padding: 20px;">
+        <h1 style="color: red;">❌ ERROR DE CONEXIÓN</h1>
+        <p>${err.message}</p>
+        <pre>${JSON.stringify(err, null, 2)}</pre>
+      </div>
     `);
   } finally {
     if (client) client.release();
