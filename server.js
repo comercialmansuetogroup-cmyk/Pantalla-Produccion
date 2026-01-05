@@ -19,7 +19,8 @@ const pool = new Pool({
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// Inicialización DB
+// --- INICIALIZACIÓN DE LA BASE DE DATOS ---
+// Esta función se ejecuta al arrancar. Si la DB está vacía, crea las tablas.
 const initDB = async () => {
   if (!process.env.DATABASE_URL) {
     console.log('⚠️ [SYSTEM] Running without Database Connection (Memory Mode - Data will not persist)');
@@ -28,15 +29,16 @@ const initDB = async () => {
   try {
     const client = await pool.connect();
     try {
-      console.log('🔄 [DB] Syncing Tables & Cleaning...');
+      console.log('🔄 [DB] Verificando estructura de tablas...');
       
-      // 1. Limpieza de tablas basura si existen
+      // 1. Limpieza de tablas antiguas o basura (Legacy)
       await client.query('DROP TABLE IF EXISTS daily_stats'); 
       await client.query('DROP TABLE IF EXISTS "DALL·E STATS"'); 
 
-      // 2. Creación de tablas Core
+      // 2. Creación de tablas Core (Si no existen, se crean)
       await client.query(`
         -- TABLA 1: LIBRO DE PEDIDOS (La Realidad)
+        -- Guarda cada línea de pedido recibida con fecha y hora.
         CREATE TABLE IF NOT EXISTS orders (
           id SERIAL PRIMARY KEY,
           agent_code TEXT,
@@ -46,28 +48,36 @@ const initDB = async () => {
           quantity NUMERIC DEFAULT 0,
           received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+        -- Índice para agilizar las consultas por fecha (Analítica)
+        CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(received_at);
+
         -- TABLA 2: ALMACÉN (El Escáner)
+        -- Guarda el stock físico actual.
         CREATE TABLE IF NOT EXISTS inventory (
           product_code TEXT PRIMARY KEY,
           stock_qty NUMERIC DEFAULT 0
         );
         
         -- TABLA 3: EL PORTERO (Memoria de Duplicados)
+        -- Imprescindible para evitar duplicados si Make reintenta el envío.
         CREATE TABLE IF NOT EXISTS webhook_memory (
           line_hash TEXT PRIMARY KEY,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        -- Índice para limpieza automática (si se decidiera implementar en el futuro)
+        CREATE INDEX IF NOT EXISTS idx_memory_date ON webhook_memory(created_at);
       `);
-      console.log('✅ [DB] System Ready. Tables: orders, inventory, webhook_memory');
+      console.log('✅ [DB] Base de Datos lista y estructurada: orders, inventory, webhook_memory');
     } finally {
       client.release();
     }
-  } catch (err) { console.error('❌ [DB] Connection Error:', err.message); }
+  } catch (err) { console.error('❌ [DB] Error de Conexión/Inicialización:', err.message); }
 };
+
+// Ejecutamos la inicialización
 initDB();
 
-// --- SSE SYSTEM ---
+// --- SSE SYSTEM (Eventos en tiempo real) ---
 let clients = [];
 
 app.get('/api/events', (req, res) => {
@@ -135,8 +145,6 @@ app.post('/api/webhook', async (req, res) => {
           lastCode = String(p.codigo || 'UNKNOWN').toUpperCase().trim();
           
           // --- LOGICA DE REDONDEO ESTRICTO (SOLICITUD V4) ---
-          // Si llega decimal (ej: 3.8), se corta a entero (3). 
-          // Se aplica ANTES de cualquier cálculo para asegurar integridad.
           const qty = Math.floor(Number(p.cantidad) || 0); 
           
           const finalProductName = p.nombre || topLevelProductName;
@@ -158,14 +166,13 @@ app.post('/api/webhook', async (req, res) => {
             if (checkMem.rows.length === 0) {
               // -> NO ESTÁ EN MEMORIA. Es nuevo.
               
-              // Verificación extra de seguridad: ¿Existe ya en 'orders' aunque no esté en memoria? (Por si se borró la memoria)
-              // Buscamos filas idénticas insertadas HOY (usando fecha servidor)
+              // Verificación extra de seguridad (Doble Check contra Orders real)
               const checkDB = await client.query(
                 `SELECT COUNT(*) as cnt FROM orders 
                  WHERE agent_code = $1 
                  AND product_code = $2 
                  AND quantity = $3 
-                 AND received_at >= CURRENT_DATE`, // Postgres CURRENT_DATE es seguro
+                 AND received_at >= CURRENT_DATE`, 
                 [code, lastCode, qty]
               );
               
@@ -174,7 +181,7 @@ app.post('/api/webhook', async (req, res) => {
               if (existingInDB >= currentCount) {
                  // YA ESTÁ EN ORDERS. Solo actualizamos la memoria para que no vuelva a molestar.
                  await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1) ON CONFLICT DO NOTHING', [lineHash]);
-                 countSkipped++; // Lo contamos como skippeado porque no sumó cantidad real
+                 countSkipped++;
               } else {
                  // NO ESTÁ EN ORDERS. Insertamos de verdad.
                  await client.query(
@@ -198,9 +205,7 @@ app.post('/api/webhook', async (req, res) => {
     await client.query('COMMIT');
     console.log(`✅ [SYNC] New Lines Inserted: ${countInsert} | Skipped (Already Exists): ${countSkipped}`);
     
-    // SIEMPRE notificamos, incluso si countInsert es 0, para asegurar que el frontend está despierto
     notifyClients(lastCode, 'order');
-    
     res.json({ ok: true, inserted: countInsert, skipped: countSkipped });
 
   } catch (err) {
@@ -214,7 +219,7 @@ app.post('/api/webhook', async (req, res) => {
 
 app.post('/api/scan', async (req, res) => {
   const authHeader = req.headers.authorization;
-  // CAMBIO: Credenciales actualizadas a V4_KEY_2026
+  // Credencial V4 Nueva
   if (!authHeader || authHeader !== 'Bearer DASHBOARD_V4_KEY_2026') {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -250,7 +255,6 @@ app.post('/api/scan', async (req, res) => {
 app.get('/api/data', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.json([]);
   
-  // FIX: Forzar no-cache para evitar que el navegador muestre datos borrados tras un reset
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
@@ -341,10 +345,8 @@ app.get('/api/history', async (req, res) => {
 app.post('/api/reset', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.json({ ok: true });
   
-  // Conexión dedicada para el reset
   const client = await pool.connect();
   try {
-    // FIX: TRUNCATE CASCADE para un borrado instantáneo y total
     await client.query('TRUNCATE TABLE orders, inventory, webhook_memory RESTART IDENTITY CASCADE');
     console.log('⚠️ [RESET] SYSTEM FACTORY RESET EXECUTED');
     notifyClients('RESET');
