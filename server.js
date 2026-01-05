@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 
 // --- VERSION TAG ---
 console.log('----------------------------------------------------');
-console.log('🚀 [SYSTEM] INICIANDO VERSION 3.1 - LÓGICA DE UNIDADES EN BACKEND');
+console.log('🚀 [SYSTEM] INICIANDO VERSION 3.2 - FIX NORMALIZACIÓN CÓDIGOS');
 console.log('----------------------------------------------------');
 
 // Configuración de conexión DB Robustecida para Railway
@@ -25,7 +25,7 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
 // --- TABLA MAESTRA DE CONVERSIÓN (BULTOS -> PIEZAS) ---
-// Esta es la fuente de verdad. Si Make manda 1 caja de BUR11, guardamos 30 unidades.
+// NOTA: Los códigos deben coincidir con lo que llega de Make (sin #)
 const PRODUCT_PACK_SIZE = {
   'BUR11': 30,  // BURRATA VASO 80GR (BANDEJA 30 PIEZAS)
   'BUR13': 40,  // BURRATA VASO 60g (BANDEJA 40 PIEZAS)
@@ -127,7 +127,7 @@ app.get('/api/test-db', async (req, res) => {
   try {
     client = await pool.connect();
     await client.query(createTablesSQL);
-    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.1</h1><p>Lógica de multiplicación de unidades activa en servidor.</p>`);
+    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.2</h1><p>Sistema de normalización de códigos activo (Quita # y espacios).</p>`);
   } catch (err) {
     res.status(500).send(`<h1 style="color:red">❌ ERROR</h1><pre>${err.message}</pre>`);
   } finally {
@@ -167,23 +167,27 @@ app.post('/api/webhook', async (req, res) => {
 
       if (z.productos && Array.isArray(z.productos)) {
         for (const p of z.productos) {
-          // Normalización estricta del código de producto
-          const rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase().trim();
+          // --- NORMALIZACIÓN ROBUSTA DEL CÓDIGO ---
+          // 1. Convertir a string y mayúsculas
+          // 2. Eliminar prefijo '#' si existe (ej: '#BUR11' -> 'BUR11')
+          // 3. Eliminar espacios internos (ej: 'BUR 11' -> 'BUR11')
+          // 4. Eliminar espacios extremos (trim)
+          let rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase();
+          rawProductCode = rawProductCode.replace(/^#/, ''); // Quita # al inicio
+          rawProductCode = rawProductCode.replace(/\s+/g, ''); // Quita todos los espacios
+          
           const finalProductName = p.nombre || topLevelProductName;
           
           let rawQty = Math.floor(Number(p.cantidad) || 0);
 
           if (rawQty > 0) {
             // --- LÓGICA CORE: MULTIPLICACIÓN DE UNIDADES ---
-            // Si el código está en nuestra lista de packs, multiplicamos.
-            // Si no está, asumimos que es 1 unidad por defecto.
             const packSize = PRODUCT_PACK_SIZE[rawProductCode] || 1;
             const finalQtyUnits = rawQty * packSize;
 
             lastCode = rawProductCode;
 
-            // Generación de Hash Anti-Duplicados
-            // Usamos rawQty en el hash para distinguir si llega otro pedido con distinta cantidad original
+            // Generación de Hash Anti-Duplicados usando la cantidad original (rawQty)
             const occurrenceKey = `${agentCode}-${rawProductCode}-${rawQty}`;
             const currentCount = (batchOccurrences.get(occurrenceKey) || 0) + 1;
             batchOccurrences.set(occurrenceKey, currentCount);
@@ -194,14 +198,13 @@ app.post('/api/webhook', async (req, res) => {
             const checkMem = await client.query('SELECT 1 FROM webhook_memory WHERE line_hash = $1', [lineHash]);
 
             if (checkMem.rows.length === 0) {
-              // Verificación doble en DB por si reiniciaron el server
               const checkDB = await client.query(
                 `SELECT COUNT(*) as cnt FROM orders 
                  WHERE agent_code = $1 
                  AND product_code = $2 
                  AND quantity = $3 
                  AND received_at >= CURRENT_DATE`, 
-                [agentCode, rawProductCode, finalQtyUnits] // Buscamos por la cantidad convertida
+                [agentCode, rawProductCode, finalQtyUnits] 
               );
               
               const existingInDB = parseInt(checkDB.rows[0].cnt || '0', 10);
@@ -210,7 +213,6 @@ app.post('/api/webhook', async (req, res) => {
                  await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1) ON CONFLICT DO NOTHING', [lineHash]);
                  countSkipped++;
               } else {
-                 // INSERTAMOS LA CANTIDAD YA MULTIPLICADA (finalQtyUnits)
                  await client.query(
                   `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity) 
                    VALUES ($1, $2, $3, $4, $5)`,
@@ -219,9 +221,9 @@ app.post('/api/webhook', async (req, res) => {
                  await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1)', [lineHash]);
                  countInsert++;
                  
-                 // Log de verificación para consola
+                 // Log explícito para depuración
                  if (packSize > 1) {
-                    console.log(`📦 [PACK DETECTED] ${rawProductCode}: Entrada ${rawQty} cajas -> Guardado ${finalQtyUnits} unidades.`);
+                    console.log(`📦 [CONVERSION] Code: ${rawProductCode} | Pack: ${packSize} | In: ${rawQty} -> Out: ${finalQtyUnits}`);
                  }
               }
             } else {
@@ -261,11 +263,9 @@ app.post('/api/scan', async (req, res) => {
   const client = await pool.connect();
   try {
     const qtyNum = Number(cantidad);
-    const codeStr = String(codigo).toUpperCase().trim();
+    // Aplicamos la misma normalización al scan por si acaso
+    let codeStr = String(codigo).toUpperCase().replace(/^#/, '').replace(/\s+/g, '');
 
-    // NOTA: Asumimos que el scan pistola ya cuenta unidades o cajas según convenga al operario.
-    // Si se necesitara multiplicar aquí también, se usaría PRODUCT_PACK_SIZE[codeStr]
-    
     await client.query(
       `INSERT INTO inventory (product_code, stock_qty) 
        VALUES ($1, $2)
@@ -292,7 +292,6 @@ app.get('/api/data', async (req, res) => {
   res.setHeader('Expires', '0');
   
   try {
-    // La consulta es idéntica, pero ahora 'quantity' ya contiene las PIEZAS REALES.
     const result = await pool.query(`
       WITH RankedDates AS (
         SELECT DISTINCT received_at::DATE as r_date
@@ -326,7 +325,6 @@ app.get('/api/data', async (req, res) => {
   }
 });
 
-// ... resto de endpoints iguales (history, reset) ...
 app.get('/api/history', async (req, res) => {
   if (!process.env.DATABASE_URL) return res.json([]);
   const { period } = req.query; 
