@@ -214,7 +214,8 @@ app.post('/api/webhook', async (req, res) => {
 
 app.post('/api/scan', async (req, res) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || authHeader !== 'Bearer DASHBOARD_V3_KEY_2025') {
+  // CAMBIO: Credenciales actualizadas a V4_KEY_2026
+  if (!authHeader || authHeader !== 'Bearer DASHBOARD_V4_KEY_2026') {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
