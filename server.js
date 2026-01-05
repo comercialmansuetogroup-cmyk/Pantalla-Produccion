@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 
 // --- VERSION TAG ---
 console.log('----------------------------------------------------');
-console.log('🚀 [SYSTEM] INICIANDO VERSION 3.4 - DEBUG & CLEANING');
+console.log('🚀 [SYSTEM] INICIANDO VERSION 3.3 - CORRECCIÓN UNIDADES REALES');
 console.log('----------------------------------------------------');
 
 // Configuración de conexión DB Robustecida para Railway
@@ -24,10 +24,8 @@ const pool = new Pool({
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// =================================================================================
-// 📍 ZONA 1: LISTA DE PRODUCTOS Y SUS UNIDADES POR CAJA
-// Aquí definimos cuántas piezas trae cada caja.
-// =================================================================================
+// --- TABLA MAESTRA DE CONVERSIÓN (BULTOS -> PIEZAS) ---
+// Fuente de verdad: Si llega un código de esta lista, se multiplica la cantidad por este valor.
 const PRODUCT_PACK_SIZE = {
   'BUR11': 30,  // BURRATA VASO 80GR (BANDEJA 30 PIEZAS)
   'BUR13': 40,  // BURRATA VASO 60g (BANDEJA 40 PIEZAS)
@@ -129,7 +127,7 @@ app.get('/api/test-db', async (req, res) => {
   try {
     client = await pool.connect();
     await client.query(createTablesSQL);
-    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.4</h1><p>Sistema de cálculo de unidades con limpieza estricta de caracteres.</p>`);
+    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.3</h1><p>Sistema de cálculo de unidades reales activo.</p>`);
   } catch (err) {
     res.status(500).send(`<h1 style="color:red">❌ ERROR</h1><pre>${err.message}</pre>`);
   } finally {
@@ -169,41 +167,31 @@ app.post('/api/webhook', async (req, res) => {
 
       if (z.productos && Array.isArray(z.productos)) {
         for (const p of z.productos) {
-          
-          // --- LIMPIEZA DE CÓDIGO ---
-          // 1. Convertir a mayúsculas
-          // 2. Quitar '#' al inicio
-          // 3. Quitar todos los espacios (incluidos los internos 'BUR 11' -> 'BUR11')
-          // 4. Quitar caracteres invisibles raros (Zero-width space)
+          // --- 1. NORMALIZACIÓN DEL CÓDIGO ---
+          // Limpiamos basura: Espacios, símbolo #, minúsculas.
           let rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase();
           rawProductCode = rawProductCode.replace(/^#/, ''); 
           rawProductCode = rawProductCode.replace(/\s+/g, '');
-          rawProductCode = rawProductCode.replace(/[\u200B-\u200D\uFEFF]/g, ''); // Limpieza profunda
           
           const finalProductName = p.nombre || topLevelProductName;
           
+          // --- 2. CANTIDAD ENTRANTE (CAJAS/BULTOS) ---
           let rawQtyBoxes = Math.floor(Number(p.cantidad) || 0);
 
           if (rawQtyBoxes > 0) {
-            
-            // ===============================================================================
-            // 📍 ZONA 2: CÁLCULO DE MULTIPLICACIÓN
-            // Buscamos el código limpio en la lista. Si existe, multiplicamos.
-            // ===============================================================================
+            // --- 3. CÁLCULO DE UNIDADES REALES ---
+            // Buscamos si el código está en la tabla maestra. Si no, factor = 1.
             const packSize = PRODUCT_PACK_SIZE[rawProductCode] || 1;
             const finalQtyUnits = rawQtyBoxes * packSize;
 
-            // LOG DE AUDITORÍA: Muestra qué pasó con cada producto
-            if (PRODUCT_PACK_SIZE[rawProductCode]) {
-               console.log(`✅ MATCH EN LISTA: Código [${rawProductCode}] | Entran ${rawQtyBoxes} cajas | Pack ${packSize} | ==> SE GUARDAN ${finalQtyUnits} UNIDADES`);
-            } else {
-               // Descomentar si quieres ver los que NO coinciden
-               // console.log(`ℹ️ NO MATCH: Código [${rawProductCode}] | Se guarda tal cual: ${finalQtyUnits}`);
-            }
-
             lastCode = rawProductCode;
 
-            // --- PREVENCIÓN DE DUPLICADOS ---
+            // Log de depuración importante para ver en la consola de Railway
+            if (packSize > 1) {
+              console.log(`📦 [CONVERSION APPLIED] Code: ${rawProductCode} | Input Boxes: ${rawQtyBoxes} | Pack Size: ${packSize} | ==> Saving Units: ${finalQtyUnits}`);
+            }
+
+            // --- 4. PREVENCIÓN DE DUPLICADOS ---
             const occurrenceKey = `${agentCode}-${rawProductCode}-${rawQtyBoxes}`;
             const currentCount = (batchOccurrences.get(occurrenceKey) || 0) + 1;
             batchOccurrences.set(occurrenceKey, currentCount);
@@ -214,7 +202,7 @@ app.post('/api/webhook', async (req, res) => {
             const checkMem = await client.query('SELECT 1 FROM webhook_memory WHERE line_hash = $1', [lineHash]);
 
             if (checkMem.rows.length === 0) {
-                 // GUARDADO EN DB (finalQtyUnits ya tiene la multiplicación hecha)
+                 // --- 5. INSERTAR EN BASE DE DATOS LA CANTIDAD FINAL (PIEZAS) ---
                  await client.query(
                   `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity) 
                    VALUES ($1, $2, $3, $4, $5)`,
@@ -260,7 +248,7 @@ app.post('/api/scan', async (req, res) => {
   try {
     const qtyNum = Number(cantidad);
     // Aplicamos la misma normalización al scan
-    let codeStr = String(codigo).toUpperCase().replace(/^#/, '').replace(/\s+/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+    let codeStr = String(codigo).toUpperCase().replace(/^#/, '').replace(/\s+/g, '');
 
     await client.query(
       `INSERT INTO inventory (product_code, stock_qty) 
