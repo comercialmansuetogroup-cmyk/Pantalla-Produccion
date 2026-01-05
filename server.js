@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 
 // --- VERSION TAG ---
 console.log('----------------------------------------------------');
-console.log('🚀 [SYSTEM] INICIANDO VERSION 4.0 - SMART UPSERT (NO DUPLICATES)');
+console.log('🚀 [SYSTEM] INICIANDO VERSION 4.5 - SYNC & CLEAN (AUTO-DELETE)');
 console.log('----------------------------------------------------');
 
 // Configuración de conexión DB Robustecida para Railway
@@ -65,16 +65,15 @@ const initDB = async () => {
   try {
     client = await pool.connect();
     
-    // MIGRACIÓN 4.0: Asegurar que existe la columna record_key y eliminar unique_hash si existe
+    // MIGRACIÓN: Asegurar estructura
     await client.query(`
       DO $$ 
       BEGIN 
-        -- Añadir record_key si no existe
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='record_key') THEN 
           ALTER TABLE orders ADD COLUMN record_key TEXT UNIQUE; 
         END IF;
-
-        -- Eliminar restricción de unique_hash antiguo si existe para evitar conflictos
+        
+        -- Limpieza de columnas viejas si existen
         IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='unique_hash') THEN
            ALTER TABLE orders DROP COLUMN unique_hash;
         END IF;
@@ -83,7 +82,7 @@ const initDB = async () => {
 
     await client.query('DROP TABLE IF EXISTS webhook_memory'); 
     await client.query(createTablesSQL);
-    console.log('✅ [DB] Tablas verificadas correctamente. Modo UPSERT Activo.');
+    console.log('✅ [DB] Tablas verificadas. Sistema Sync & Clean activo.');
   } catch (err) { 
     console.error('❌ [DB ERROR] Fallo al iniciar tablas:', err.message); 
   } finally {
@@ -128,7 +127,7 @@ app.get('/api/test-db', async (req, res) => {
   try {
     client = await pool.connect();
     await client.query(createTablesSQL);
-    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V4.0</h1><p>Sistema de Actualización Inteligente (Upsert) Activo.</p>`);
+    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V4.5</h1><p>Sistema Sync & Clean Activo (Borrado automático de líneas inexistentes).</p>`);
   } catch (err) {
     res.status(500).send(`<h1 style="color:red">❌ ERROR</h1><pre>${err.message}</pre>`);
   } finally {
@@ -156,52 +155,57 @@ app.post('/api/webhook', async (req, res) => {
     let lastCode = null;
     let countInsert = 0;
     let countUpdated = 0;
+    let countDeleted = 0;
     
     const now = new Date();
-    // Usamos fecha local exacta YYYY-MM-DD para agrupar por día
     const todayStr = now.toISOString().split('T')[0]; 
+
+    // LISTAS DE CONTROL PARA LIMPIEZA
+    const activeKeysThisPayload = []; // Guardaremos todas las llaves procesadas en ESTE webhook
+    const affectedAgents = new Set(); // Guardaremos qué agentes se tocaron
 
     for (const z of zonas) {
       const agentCode = String(z.codigo_agente ?? '0').trim(); 
+      affectedAgents.add(agentCode); // Marcamos este agente como "tocado" hoy
+
       const agentName = z.nombre_agente || 'DESCONOCIDO';
       const topLevelProductName = z.nombre || 'PRODUCTO';
 
       if (z.productos && Array.isArray(z.productos)) {
         for (const p of z.productos) {
           
-          // --- LIMPIEZA DE CÓDIGO ---
           let rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase();
           rawProductCode = rawProductCode.replace(/^#/, '').replace(/\s+/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '');
           
           const finalProductName = p.nombre || topLevelProductName;
           let rawQtyBoxes = Math.floor(Number(p.cantidad) || 0);
 
-          if (rawQtyBoxes > 0) {
-            
-            // ===============================================================================
-            // 📍 ZONA DE CÁLCULO Y MULTIPLICACIÓN
-            // ===============================================================================
+          // IMPORTANTE: Incluso si la cantidad es 0, lo procesamos para que cuente como "visto" 
+          // y el sistema decida si borrarlo o dejarlo en 0. 
+          // Si Factorsol manda 0 explícitamente, actualizamos a 0.
+          
+          if (rawQtyBoxes >= 0) { 
             const packSize = PRODUCT_PACK_SIZE[rawProductCode] || 1;
             const finalQtyUnits = rawQtyBoxes * packSize;
 
             lastCode = rawProductCode;
 
-            // ===============================================================================
-            // 📍 LÓGICA DE UNICIDAD (SOLUCIÓN DUPLICADOS)
-            // Creamos una llave única: AGENTE + PRODUCTO + FECHA
-            // Si esta llave ya existe en la DB, NO creamos una nueva, ACTUALIZAMOS la existente.
-            // ===============================================================================
+            // LLAVE ÚNICA DE SINCRONIZACIÓN
             const recordKey = `${agentCode}-${rawProductCode}-${todayStr}`;
+            
+            // Añadimos a la lista de "Vivos"
+            activeKeysThisPayload.push(recordKey);
 
+            // UPSERT (Insertar o Actualizar)
             const result = await client.query(
               `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity, record_key) 
                VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (record_key) 
                DO UPDATE SET 
-                  quantity = EXCLUDED.quantity, -- Aquí se actualiza la cantidad a la nueva (ej: de 100 a 150)
+                  quantity = EXCLUDED.quantity,
                   product_name = EXCLUDED.product_name,
                   received_at = CURRENT_TIMESTAMP
-               RETURNING (xmax = 0) AS inserted`, // xmax=0 implica insert, de lo contrario update
+               RETURNING (xmax = 0) AS inserted`, 
               [agentCode, agentName, rawProductCode, finalProductName, finalQtyUnits, recordKey]
             );
 
@@ -209,19 +213,49 @@ app.post('/api/webhook', async (req, res) => {
               countInsert++;
             } else {
               countUpdated++;
-              // Log especial para cuando se modifica un pedido existente
-              console.log(`♻️ [UPDATE] Pedido Modificado: ${agentCode} | ${rawProductCode} | Nueva Cantidad: ${finalQtyUnits}`);
             }
           }
         }
       }
     }
 
+    // =================================================================================
+    // 🧹 ZONA DE LIMPIEZA (GARBAGE COLLECTION)
+    // =================================================================================
+    // Si hemos procesado agentes, debemos borrar de la DB cualquier línea de ESOS agentes
+    // para la fecha de HOY que NO haya venido en este payload (es decir, líneas borradas en origen).
+    
+    if (affectedAgents.size > 0 && activeKeysThisPayload.length > 0) {
+      const agentsArray = Array.from(affectedAgents);
+      
+      const deleteResult = await client.query(`
+        DELETE FROM orders 
+        WHERE agent_code = ANY($1) 
+          AND record_key LIKE '%' || $2  -- Que contenga la fecha de hoy
+          AND record_key != ALL($3)      -- Que NO esté en la lista de llaves vivas
+      `, [agentsArray, todayStr, activeKeysThisPayload]);
+      
+      countDeleted = deleteResult.rowCount;
+      if (countDeleted > 0) {
+        console.log(`🗑️ [CLEANUP] Eliminadas ${countDeleted} líneas obsoletas (borradas en origen).`);
+      }
+    } else if (affectedAgents.size > 0 && activeKeysThisPayload.length === 0) {
+       // Caso extremo: El webhook manda el agente pero SIN productos (borró todo el pedido)
+       const agentsArray = Array.from(affectedAgents);
+       const deleteResult = await client.query(`
+        DELETE FROM orders 
+        WHERE agent_code = ANY($1) 
+          AND record_key LIKE '%' || $2
+      `, [agentsArray, todayStr]);
+      countDeleted = deleteResult.rowCount;
+      console.log(`🗑️ [CLEANUP TOTAL] Agente enviado vacío. Eliminadas ${countDeleted} líneas.`);
+    }
+
     await client.query('COMMIT');
-    console.log(`✅ [SYNC] Procesado. Nuevos: ${countInsert} | Actualizados: ${countUpdated}`);
+    console.log(`✅ [SYNC] Procesado. Nuevos: ${countInsert} | Actualizados: ${countUpdated} | Eliminados: ${countDeleted}`);
     
     notifyClients(lastCode, 'order');
-    res.json({ ok: true, inserted: countInsert, updated: countUpdated });
+    res.json({ ok: true, inserted: countInsert, updated: countUpdated, deleted: countDeleted });
 
   } catch (err) {
     await client.query('ROLLBACK');
