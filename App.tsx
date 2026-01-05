@@ -5,7 +5,6 @@ import { ClientColumn } from './components/ClientColumn';
 import { StatsDashboard } from './components/StatsDashboard';
 import { SettingsModal } from './components/SettingsModal';
 import { DEFAULT_SETTINGS, CLIENT_MAPPING } from './types';
-import { PRODUCT_UNITS } from './constants';
 
 export default function App() {
   const [view, setView] = useState<'live' | 'stats'>('live');
@@ -31,30 +30,22 @@ export default function App() {
       setIsConnecting(true);
       setErrorMsg(null);
       
-      // FIX: Añadido { cache: 'no-store' } para evitar datos fantasma tras reset
       const res = await fetch('/api/data', { cache: 'no-store' });
       if (!res.ok) throw new Error(`API Error: ${res.status}`);
       
       const raw = await res.json();
       
-      // 1. FASE DE AGREGACIÓN: Sumarizar cantidades (Hoy vs Ayer)
+      // 1. FASE DE AGREGACIÓN
       const groups: Record<string, any> = {};
       const globalStockMap = new Map<string, number>();
 
       if (Array.isArray(raw)) {
         raw.forEach((row: any) => {
-          // Ignorar filas vacías de datos
+          // Ignorar filas vacías
           if (Number(row.total_qty) === 0 && Number(row.yesterday_qty) === 0 && Number(row.global_stock) === 0) return;
 
-          // Normalizar código
           const rawCode = String(row.agent_code ?? '').trim();
-          const pCodeRaw = String(row.product_code ?? '').trim().toUpperCase();
           
-          // --- LÓGICA DE CONVERSIÓN DE UNIDADES (PIEZAS) ---
-          // Buscamos si el producto tiene un multiplicador definido (Ej: BUR11 -> 30)
-          // Si no existe, usamos 1 (mantenemos la cantidad original)
-          const multiplier = PRODUCT_UNITS[pCodeRaw] || 1;
-
           // Mapeo de Cliente (Gran Canaria agrupa 10, 14, 5, 0, 8)
           const clientName = CLIENT_MAPPING[rawCode] || row.agent_name || `ZONA ${rawCode}`;
           
@@ -67,42 +58,37 @@ export default function App() {
             };
           }
           
-          // Guardar Stock Global (También aplicamos multiplicador al stock si se cuenta en cajas pero queremos ver piezas)
-          // Asumimos que el scanner lee códigos de barras de la caja (bulto)
+          // NOTA: El stock viene de una tabla manual, asumimos que se introduce en piezas o bultos según operativa.
+          // El 'total_qty' YA VIENE MULTIPLICADO POR EL SERVIDOR (Son piezas reales)
           const stockRaw = Number(row.global_stock);
-          const stockPieces = stockRaw * multiplier;
-          globalStockMap.set(row.product_code, stockPieces);
+          globalStockMap.set(row.product_code, stockRaw);
 
-          // Cantidades Multiplicadas
-          const qtyToday = Number(row.total_qty) * multiplier;
-          const qtyYesterday = Number(row.yesterday_qty) * multiplier;
+          const qtyToday = Number(row.total_qty);
+          const qtyYesterday = Number(row.yesterday_qty);
 
-          // Buscar si el producto ya existe en este cliente (para agrupar códigos de agente)
+          // Buscar si el producto ya existe en este cliente
           const existingProd = groups[clientName].products.find((p: any) => p.code === row.product_code);
           
           if (existingProd) {
-             // SUMA SIMPLE
              existingProd.qty += qtyToday;
              existingProd.yesterdayQty += qtyYesterday;
           } else {
-            // NUEVO PRODUCTO
             groups[clientName].products.push({
               code: row.product_code,
               name: row.product_name,
               qty: qtyToday,
               yesterdayQty: qtyYesterday, 
               stock: 0, 
-              trend: 0 // Se calculará en la Fase 2
+              trend: 0 
             });
           }
 
-          // Acumuladores Totales del Cliente
           groups[clientName].totalToday += qtyToday;
           groups[clientName].totalYesterday += qtyYesterday;
         });
       }
 
-      // 2. FASE DE CÁLCULO: Porcentajes y Stock
+      // 2. FASE DE CÁLCULO
       const sortedClients = Object.values(groups).sort((a,b) => {
         if(a.name === 'GRAN CANARIA') return -1;
         if(b.name === 'GRAN CANARIA') return 1;
@@ -110,19 +96,15 @@ export default function App() {
       });
 
       sortedClients.forEach(client => {
-         // A) CÁLCULO TENDENCIA GLOBAL DEL CLIENTE
          let clientTrend = 0;
          if (client.totalYesterday > 0) {
-            // Fórmula: ((Actual - Anterior) / Anterior) * 100
             clientTrend = ((client.totalToday - client.totalYesterday) / client.totalYesterday) * 100;
          } else if (client.totalToday > 0) {
-            clientTrend = 100; // Crecimiento infinito (Nuevo ingreso)
+            clientTrend = 100;
          }
          client.trend = clientTrend;
 
-         // B) CÁLCULO TENDENCIA POR PRODUCTO Y STOCK
          client.products.forEach((p: any) => {
-             // Tendencia de Línea
              let prodTrend = 0;
              if (p.yesterdayQty > 0) {
                 prodTrend = ((p.qty - p.yesterdayQty) / p.yesterdayQty) * 100;
@@ -131,7 +113,6 @@ export default function App() {
              }
              p.trend = prodTrend;
 
-             // Algoritmo de Consumo de Stock
              const available = globalStockMap.get(p.code) || 0;
              const needed = p.qty;
              const assigned = Math.min(needed, available);
@@ -140,13 +121,10 @@ export default function App() {
              globalStockMap.set(p.code, Math.max(0, available - assigned));
          });
          
-         // Ordenar productos por cantidad descendente
          client.products.sort((a: any, b: any) => b.qty - a.qty);
       });
 
-      // 3. FILTRADO FINAL (Solo clientes con actividad hoy)
       const activeClientsToday = sortedClients.filter(c => c.totalToday > 0);
-
       setData(activeClientsToday);
 
     } catch (e: any) { 
@@ -173,15 +151,11 @@ export default function App() {
 
       es.onmessage = (e) => {
         if (e.data === ':' || e.data.trim() === '') return;
-        
         const rawData = e.data?.trim();
         if (!rawData) return;
-        
         try {
           const msg = JSON.parse(rawData);
-          // Si recibimos evento, refrescamos datos
           fetchData();
-          
           if (msg.code) {
             setHighlightedCode(msg.code);
             setTimeout(() => setHighlightedCode(null), 3000);
@@ -196,7 +170,6 @@ export default function App() {
     };
 
     connectSSE();
-    
     const interval = setInterval(fetchData, 15000);
 
     return () => {
