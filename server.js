@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 
 // --- VERSION TAG ---
 console.log('----------------------------------------------------');
-console.log('🚀 [SYSTEM] INICIANDO VERSION 3.3 - CORRECCIÓN UNIDADES REALES');
+console.log('🚀 [SYSTEM] INICIANDO VERSION 3.2 - FIX NORMALIZACIÓN CÓDIGOS');
 console.log('----------------------------------------------------');
 
 // Configuración de conexión DB Robustecida para Railway
@@ -25,7 +25,7 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
 // --- TABLA MAESTRA DE CONVERSIÓN (BULTOS -> PIEZAS) ---
-// Fuente de verdad: Si llega un código de esta lista, se multiplica la cantidad por este valor.
+// NOTA: Los códigos deben coincidir con lo que llega de Make (sin #)
 const PRODUCT_PACK_SIZE = {
   'BUR11': 30,  // BURRATA VASO 80GR (BANDEJA 30 PIEZAS)
   'BUR13': 40,  // BURRATA VASO 60g (BANDEJA 40 PIEZAS)
@@ -35,12 +35,12 @@ const PRODUCT_PACK_SIZE = {
   'BUR7': 10,   // BURRATA 100 GR BANDEJA DE 1 KG 10 PIEZAS
   'MOZ28': 8,   // SCAMORZA IN ACQUA 3.4 - 8 PIEZAS
   'MOZ30': 9,   // MOZZARELLA BOLA SECA
-  'MOZ5': 12,   // MOZZARELLA FIORDILATTE BANDEJA 3.2 FORMATO 12X250
+  'MOZ5': 12,   // MOZZARELLA FIORDILATTE BANDEJA 3.2
   'RIC3': 6,    // RICOTTA FRESCA 350 GR BANDEJA 6 PIEZAS
-  'MOZ6': 9,    // MOZZARELLA FIORDILATTE BANDEJA 3.8 FORMATO 420 GR
-  'MOH1': 9,    // MOZ FIORDILAT AHUMADA BANDEJA 3.8 FORMATO 420GR
-  'MOZ8': 10,   // MOZZARELLA FIORDILATTE SECA BANDEJA 4 KG 10X400 GR
-  'MOH10': 3    // MOZZARELLA FIORDILATTR AHUMADA BANDEJA1.2 420 APRO
+  'MOZ6': 9,    // MOZZARELLA FIORDILATTE BANDEJA 3.8
+  'MOH1': 9,    // MOZ FIORDILAT AHUMADA BANDEJA 3.8
+  'MOZ8': 10,   // MOZZARELLA FIORDILATTE SECA BANDEJA 4 KG
+  'MOH10': 3    // MOZZARELLA FIORDILATTR AHUMADA BANDEJA1.2
 };
 
 // --- FUNCIÓN DE INICIALIZACIÓN DE TABLAS ---
@@ -127,7 +127,7 @@ app.get('/api/test-db', async (req, res) => {
   try {
     client = await pool.connect();
     await client.query(createTablesSQL);
-    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.3</h1><p>Sistema de cálculo de unidades reales activo.</p>`);
+    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.2</h1><p>Sistema de normalización de códigos activo (Quita # y espacios).</p>`);
   } catch (err) {
     res.status(500).send(`<h1 style="color:red">❌ ERROR</h1><pre>${err.message}</pre>`);
   } finally {
@@ -167,42 +167,52 @@ app.post('/api/webhook', async (req, res) => {
 
       if (z.productos && Array.isArray(z.productos)) {
         for (const p of z.productos) {
-          // --- 1. NORMALIZACIÓN DEL CÓDIGO ---
-          // Limpiamos basura: Espacios, símbolo #, minúsculas.
+          // --- NORMALIZACIÓN ROBUSTA DEL CÓDIGO ---
+          // 1. Convertir a string y mayúsculas
+          // 2. Eliminar prefijo '#' si existe (ej: '#BUR11' -> 'BUR11')
+          // 3. Eliminar espacios internos (ej: 'BUR 11' -> 'BUR11')
+          // 4. Eliminar espacios extremos (trim)
           let rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase();
-          rawProductCode = rawProductCode.replace(/^#/, ''); 
-          rawProductCode = rawProductCode.replace(/\s+/g, '');
+          rawProductCode = rawProductCode.replace(/^#/, ''); // Quita # al inicio
+          rawProductCode = rawProductCode.replace(/\s+/g, ''); // Quita todos los espacios
           
           const finalProductName = p.nombre || topLevelProductName;
           
-          // --- 2. CANTIDAD ENTRANTE (CAJAS/BULTOS) ---
-          let rawQtyBoxes = Math.floor(Number(p.cantidad) || 0);
+          let rawQty = Math.floor(Number(p.cantidad) || 0);
 
-          if (rawQtyBoxes > 0) {
-            // --- 3. CÁLCULO DE UNIDADES REALES ---
-            // Buscamos si el código está en la tabla maestra. Si no, factor = 1.
+          if (rawQty > 0) {
+            // --- LÓGICA CORE: MULTIPLICACIÓN DE UNIDADES ---
             const packSize = PRODUCT_PACK_SIZE[rawProductCode] || 1;
-            const finalQtyUnits = rawQtyBoxes * packSize;
+            const finalQtyUnits = rawQty * packSize;
 
             lastCode = rawProductCode;
 
-            // Log de depuración importante para ver en la consola de Railway
-            if (packSize > 1) {
-              console.log(`📦 [CONVERSION APPLIED] Code: ${rawProductCode} | Input Boxes: ${rawQtyBoxes} | Pack Size: ${packSize} | ==> Saving Units: ${finalQtyUnits}`);
-            }
-
-            // --- 4. PREVENCIÓN DE DUPLICADOS ---
-            const occurrenceKey = `${agentCode}-${rawProductCode}-${rawQtyBoxes}`;
+            // Generación de Hash Anti-Duplicados usando la cantidad original (rawQty)
+            const occurrenceKey = `${agentCode}-${rawProductCode}-${rawQty}`;
             const currentCount = (batchOccurrences.get(occurrenceKey) || 0) + 1;
             batchOccurrences.set(occurrenceKey, currentCount);
 
-            const rawString = `${agentCode}-${rawProductCode}-${rawQtyBoxes}-${todayHashStr}-${currentCount}`;
+            const rawString = `${agentCode}-${rawProductCode}-${rawQty}-${todayHashStr}-${currentCount}`;
             const lineHash = crypto.createHash('md5').update(rawString).digest('hex');
 
             const checkMem = await client.query('SELECT 1 FROM webhook_memory WHERE line_hash = $1', [lineHash]);
 
             if (checkMem.rows.length === 0) {
-                 // --- 5. INSERTAR EN BASE DE DATOS LA CANTIDAD FINAL (PIEZAS) ---
+              const checkDB = await client.query(
+                `SELECT COUNT(*) as cnt FROM orders 
+                 WHERE agent_code = $1 
+                 AND product_code = $2 
+                 AND quantity = $3 
+                 AND received_at >= CURRENT_DATE`, 
+                [agentCode, rawProductCode, finalQtyUnits] 
+              );
+              
+              const existingInDB = parseInt(checkDB.rows[0].cnt || '0', 10);
+
+              if (existingInDB >= currentCount) {
+                 await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1) ON CONFLICT DO NOTHING', [lineHash]);
+                 countSkipped++;
+              } else {
                  await client.query(
                   `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity) 
                    VALUES ($1, $2, $3, $4, $5)`,
@@ -210,6 +220,12 @@ app.post('/api/webhook', async (req, res) => {
                  );
                  await client.query('INSERT INTO webhook_memory (line_hash) VALUES ($1)', [lineHash]);
                  countInsert++;
+                 
+                 // Log explícito para depuración
+                 if (packSize > 1) {
+                    console.log(`📦 [CONVERSION] Code: ${rawProductCode} | Pack: ${packSize} | In: ${rawQty} -> Out: ${finalQtyUnits}`);
+                 }
+              }
             } else {
               countSkipped++;
             }
@@ -247,7 +263,7 @@ app.post('/api/scan', async (req, res) => {
   const client = await pool.connect();
   try {
     const qtyNum = Number(cantidad);
-    // Aplicamos la misma normalización al scan
+    // Aplicamos la misma normalización al scan por si acaso
     let codeStr = String(codigo).toUpperCase().replace(/^#/, '').replace(/\s+/g, '');
 
     await client.query(
