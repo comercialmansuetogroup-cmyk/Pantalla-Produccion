@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 8080;
 
 // --- VERSION TAG ---
 console.log('----------------------------------------------------');
-console.log('🚀 [SYSTEM] INICIANDO VERSION 3.5 - HASH EN ORDERS TABLE');
+console.log('🚀 [SYSTEM] INICIANDO VERSION 4.0 - SMART UPSERT (NO DUPLICATES)');
 console.log('----------------------------------------------------');
 
 // Configuración de conexión DB Robustecida para Railway
@@ -43,10 +43,10 @@ const createTablesSQL = `
     product_name TEXT,
     quantity NUMERIC DEFAULT 0,
     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    unique_hash TEXT UNIQUE
+    record_key TEXT UNIQUE
   );
   CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(received_at);
-  CREATE INDEX IF NOT EXISTS idx_orders_hash ON orders(unique_hash);
+  CREATE INDEX IF NOT EXISTS idx_orders_key ON orders(record_key);
 
   CREATE TABLE IF NOT EXISTS inventory (
     product_code TEXT PRIMARY KEY,
@@ -65,24 +65,25 @@ const initDB = async () => {
   try {
     client = await pool.connect();
     
-    // MIGRACIÓN: Asegurar que existe la columna unique_hash
+    // MIGRACIÓN 4.0: Asegurar que existe la columna record_key y eliminar unique_hash si existe
     await client.query(`
       DO $$ 
       BEGIN 
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='unique_hash') THEN 
-          ALTER TABLE orders ADD COLUMN unique_hash TEXT UNIQUE; 
-        END IF; 
+        -- Añadir record_key si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='record_key') THEN 
+          ALTER TABLE orders ADD COLUMN record_key TEXT UNIQUE; 
+        END IF;
+
+        -- Eliminar restricción de unique_hash antiguo si existe para evitar conflictos
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='unique_hash') THEN
+           ALTER TABLE orders DROP COLUMN unique_hash;
+        END IF;
       END $$;
     `);
 
-    // Limpieza de legacy
-    await client.query('DROP TABLE IF EXISTS daily_stats'); 
-    await client.query('DROP TABLE IF EXISTS "DALL·E STATS"'); 
-    // Ya no necesitamos webhook_memory, usamos la columna en orders
     await client.query('DROP TABLE IF EXISTS webhook_memory'); 
-    
     await client.query(createTablesSQL);
-    console.log('✅ [DB] Tablas verificadas correctamente.');
+    console.log('✅ [DB] Tablas verificadas correctamente. Modo UPSERT Activo.');
   } catch (err) { 
     console.error('❌ [DB ERROR] Fallo al iniciar tablas:', err.message); 
   } finally {
@@ -127,7 +128,7 @@ app.get('/api/test-db', async (req, res) => {
   try {
     client = await pool.connect();
     await client.query(createTablesSQL);
-    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V3.5</h1><p>Sistema Hash Integrado en Orders.</p>`);
+    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V4.0</h1><p>Sistema de Actualización Inteligente (Upsert) Activo.</p>`);
   } catch (err) {
     res.status(500).send(`<h1 style="color:red">❌ ERROR</h1><pre>${err.message}</pre>`);
   } finally {
@@ -154,12 +155,11 @@ app.post('/api/webhook', async (req, res) => {
     
     let lastCode = null;
     let countInsert = 0;
-    let countSkipped = 0;
+    let countUpdated = 0;
     
     const now = new Date();
-    // Usamos fecha local para el hash del día
-    const todayHashStr = now.toISOString().split('T')[0]; 
-    const batchOccurrences = new Map();
+    // Usamos fecha local exacta YYYY-MM-DD para agrupar por día
+    const todayStr = now.toISOString().split('T')[0]; 
 
     for (const z of zonas) {
       const agentCode = String(z.codigo_agente ?? '0').trim(); 
@@ -178,40 +178,39 @@ app.post('/api/webhook', async (req, res) => {
 
           if (rawQtyBoxes > 0) {
             
-            // --- CONVERSIÓN ---
+            // ===============================================================================
+            // 📍 ZONA DE CÁLCULO Y MULTIPLICACIÓN
+            // ===============================================================================
             const packSize = PRODUCT_PACK_SIZE[rawProductCode] || 1;
             const finalQtyUnits = rawQtyBoxes * packSize;
 
             lastCode = rawProductCode;
 
-            // --- LÓGICA ANTI-DUPLICADOS ---
-            // Generamos una clave única para este producto en este payload
-            const occurrenceKey = `${agentCode}-${rawProductCode}-${rawQtyBoxes}`;
-            const currentCount = (batchOccurrences.get(occurrenceKey) || 0) + 1;
-            batchOccurrences.set(occurrenceKey, currentCount);
+            // ===============================================================================
+            // 📍 LÓGICA DE UNICIDAD (SOLUCIÓN DUPLICADOS)
+            // Creamos una llave única: AGENTE + PRODUCTO + FECHA
+            // Si esta llave ya existe en la DB, NO creamos una nueva, ACTUALIZAMOS la existente.
+            // ===============================================================================
+            const recordKey = `${agentCode}-${rawProductCode}-${todayStr}`;
 
-            // EL HASH ÚNICO SE GUARDA EN LA COLUMNA 'unique_hash' DE LA TABLA ORDERS
-            const rawString = `${agentCode}-${rawProductCode}-${rawQtyBoxes}-${todayHashStr}-${currentCount}`;
-            const uniqueHash = crypto.createHash('md5').update(rawString).digest('hex');
-
-            // INTENTO DE INSERCIÓN
-            // Si el hash ya existe (porque Make se ejecutó dos veces con los mismos datos), 
-            // la base de datos rechazará la inserción silenciosamente (DO NOTHING)
             const result = await client.query(
-              `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity, unique_hash) 
+              `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity, record_key) 
                VALUES ($1, $2, $3, $4, $5, $6)
-               ON CONFLICT (unique_hash) DO NOTHING
-               RETURNING id`,
-              [agentCode, agentName, rawProductCode, finalProductName, finalQtyUnits, uniqueHash]
+               ON CONFLICT (record_key) 
+               DO UPDATE SET 
+                  quantity = EXCLUDED.quantity, -- Aquí se actualiza la cantidad a la nueva (ej: de 100 a 150)
+                  product_name = EXCLUDED.product_name,
+                  received_at = CURRENT_TIMESTAMP
+               RETURNING (xmax = 0) AS inserted`, // xmax=0 implica insert, de lo contrario update
+              [agentCode, agentName, rawProductCode, finalProductName, finalQtyUnits, recordKey]
             );
 
-            if (result.rows.length > 0) {
+            if (result.rows[0].inserted) {
               countInsert++;
-              if (packSize > 1) {
-                 console.log(`📦 [NEW] ${rawProductCode} | Pack: ${packSize} | In: ${rawQtyBoxes} -> Save: ${finalQtyUnits}`);
-              }
             } else {
-              countSkipped++; // Ya existía el hash
+              countUpdated++;
+              // Log especial para cuando se modifica un pedido existente
+              console.log(`♻️ [UPDATE] Pedido Modificado: ${agentCode} | ${rawProductCode} | Nueva Cantidad: ${finalQtyUnits}`);
             }
           }
         }
@@ -219,10 +218,10 @@ app.post('/api/webhook', async (req, res) => {
     }
 
     await client.query('COMMIT');
-    console.log(`✅ [SYNC] Procesado. Insertados: ${countInsert} | Duplicados Evitados: ${countSkipped}`);
+    console.log(`✅ [SYNC] Procesado. Nuevos: ${countInsert} | Actualizados: ${countUpdated}`);
     
     notifyClients(lastCode, 'order');
-    res.json({ ok: true, inserted: countInsert, skipped: countSkipped });
+    res.json({ ok: true, inserted: countInsert, updated: countUpdated });
 
   } catch (err) {
     await client.query('ROLLBACK');
