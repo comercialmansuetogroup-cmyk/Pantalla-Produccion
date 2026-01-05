@@ -1,11 +1,16 @@
-<div align="center">
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+# FactorySync Dashboard
 
-  <h1>Built with AI Studio</h2>
+Sistema de control de producción en tiempo real.
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Características
+- Conexión SSE (Server-Sent Events)
+- Base de datos PostgreSQL
+- Visualización reactiva sin etapa de compilación compleja (ESM)
+- Modo Oscuro/Claro
+- Filtros de Analítica
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
-
-</div>
+## Estructura
+- `/api/webhook`: Endpoint para recibir datos de Make.com
+- `/api/events`: Canal de eventos en tiempo real para el frontend.
+- `/api/data`: Endpoint de persistencia.

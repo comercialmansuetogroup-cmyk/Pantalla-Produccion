@@ -1,0 +1,5 @@
+{
+  "name": "Pantalla produccion",
+  "description": "Real-time production dashboard integrating with Make automation, featuring dynamic client grouping and statistical analysis.",
+  "requestFramePermissions": []
+}
