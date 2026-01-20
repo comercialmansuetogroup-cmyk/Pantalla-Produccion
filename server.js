@@ -4,264 +4,131 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// --- VERSION TAG ---
-console.log('----------------------------------------------------');
-console.log('🚀 [SYSTEM] INICIANDO VERSION 5.0 - HYBRID SAFE MODE');
-console.log('----------------------------------------------------');
-
-// Configuración de conexión DB Robustecida para Railway
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-  connectionTimeoutMillis: 10000, 
+  connectionTimeoutMillis: 10000,
 });
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// =================================================================================
-// 📍 ZONA 1: LISTA DE PRODUCTOS Y SUS UNIDADES POR CAJA
-// =================================================================================
+// --- REGLA DE UNIDADES POR CAJA (Multiplicador) ---
 const PRODUCT_PACK_SIZE = {
-  'BUR11': 30,  'BUR13': 40,  'BUR4': 2,    'BUR5': 8,    'BUR6': 3,    
-  'BUR7': 10,   'MOZ28': 8,   'MOZ30': 9,   'MOZ5': 12,   'RIC3': 6,    
-  'MOZ6': 9,    'MOH1': 9,    'MOZ8': 10,   'MOH10': 3    
+  'BUR11': 30, 'BUR13': 40, 'BUR4': 2, 'BUR5': 8, 'BUR6': 3, 'BUR7': 10,
+  'MOZ28': 8, 'MOZ30': 9, 'MOZ5': 12, 'MOZ6': 9, 'MOZ8': 10,
+  'RIC3': 6,
+  'MOH1': 9, 'MOH10': 3
 };
-
-// --- FUNCIÓN DE INICIALIZACIÓN DE TABLAS ---
-const createTablesSQL = `
-  CREATE TABLE IF NOT EXISTS orders (
-    id SERIAL PRIMARY KEY,
-    agent_code TEXT,
-    agent_name TEXT,
-    product_code TEXT,
-    product_name TEXT,
-    quantity NUMERIC DEFAULT 0,
-    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    record_key TEXT UNIQUE
-  );
-  CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(received_at);
-  CREATE INDEX IF NOT EXISTS idx_orders_key ON orders(record_key);
-
-  CREATE TABLE IF NOT EXISTS inventory (
-    product_code TEXT PRIMARY KEY,
-    stock_qty NUMERIC DEFAULT 0
-  );
-`;
 
 const initDB = async () => {
-  if (!process.env.DATABASE_URL) {
-    console.log('⚠️ [SYSTEM] Running in MEMORY MODE (No Database URL found)');
-    return;
-  }
-  
-  console.log('🔄 [DB] Verificando tablas...');
-  let client;
+  if (!process.env.DATABASE_URL) return;
   try {
-    client = await pool.connect();
-    
-    // MIGRACIÓN: Asegurar estructura V4/V5
-    await client.query(`
-      DO $$ 
-      BEGIN 
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='record_key') THEN 
-          ALTER TABLE orders ADD COLUMN record_key TEXT UNIQUE; 
-        END IF;
-        
-        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='orders' AND column_name='unique_hash') THEN
-           ALTER TABLE orders DROP COLUMN unique_hash;
-        END IF;
-      END $$;
-    `);
-
-    await client.query('DROP TABLE IF EXISTS webhook_memory'); 
-    await client.query(createTablesSQL);
-    console.log('✅ [DB] Tablas verificadas. Modo Seguro Activo (Sin auto-delete masivo).');
-  } catch (err) { 
-    console.error('❌ [DB ERROR] Fallo al iniciar tablas:', err.message); 
-  } finally {
-    if (client) client.release();
-  }
+    const client = await pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS orders (
+          agent_code TEXT NOT NULL,
+          agent_name TEXT,
+          product_code TEXT NOT NULL,
+          product_name TEXT,
+          quantity INTEGER DEFAULT 0,
+          received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          record_key TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS inventory (
+          product_code TEXT PRIMARY KEY,
+          stock_qty NUMERIC DEFAULT 0
+        );
+      `);
+      console.log('✅ [DB] Estructura Postgres verificada y lista.');
+    } finally {
+      client.release();
+    }
+  } catch (err) { console.error('❌ [DB] Error inicializando DB:', err.message); }
 };
-
 initDB();
 
-// --- SSE SYSTEM ---
+// --- SSE (Eventos en tiempo real) ---
 let clients = [];
-
 app.get('/api/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders(); 
-
   const clientId = Date.now();
-  const newClient = { id: clientId, res };
-  clients.push(newClient);
-  res.write(': connected\n\n');
-
-  req.on('close', () => {
-    clients = clients.filter(c => c.id !== clientId);
-  });
+  clients.push({ id: clientId, res });
+  req.on('close', () => clients = clients.filter(c => c.id !== clientId));
 });
+const notifyClients = (code, type = 'update') => clients.forEach(c => c.res.write(`data: ${JSON.stringify({type, code})}\n\n`));
 
-setInterval(() => {
-  clients.forEach(c => c.res.write(': keepalive\n\n'));
-}, 30000);
-
-const notifyClients = (updatedCode, type = 'update') => {
-  clients.forEach(c => c.res.write(`data: ${JSON.stringify({type, code: updatedCode})}\n\n`));
-};
-
-// --- API ENDPOINTS ---
-
-app.get('/api/test-db', async (req, res) => {
-  if (!process.env.DATABASE_URL) return res.status(500).send("ERROR: Variable DATABASE_URL no encontrada.");
-  let client;
-  try {
-    client = await pool.connect();
-    await client.query(createTablesSQL);
-    res.send(`<h1 style="color:green">✅ CONEXIÓN OK V5.0</h1><p>Sistema Safe Mode Activo.</p>`);
-  } catch (err) {
-    res.status(500).send(`<h1 style="color:red">❌ ERROR</h1><pre>${err.message}</pre>`);
-  } finally {
-    if (client) client.release();
-  }
-});
-
+// --- WEBHOOK MAKE ---
 app.post('/api/webhook', async (req, res) => {
   const { zonas } = req.body;
-  
-  if (!zonas || !Array.isArray(zonas)) {
-    console.error('❌ [WEBHOOK] Invalid Body');
-    return res.status(400).json({ error: 'Invalid data format' });
-  }
-
-  if (!process.env.DATABASE_URL) {
-    notifyClients('TEST-CODE');
-    return res.json({ ok: true, mode: 'no-db' });
-  }
+  if (!zonas || !Array.isArray(zonas)) return res.status(400).json({ error: 'Data format error' });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    
+    const todayStr = new Date().toISOString().split('T')[0];
     let lastCode = null;
-    let countInsert = 0;
-    let countUpdated = 0;
-    let countDeleted = 0;
-    
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0]; 
 
     for (const z of zonas) {
-      const agentCode = String(z.codigo_agente ?? '0').trim(); 
-      const agentName = z.nombre_agente || 'DESCONOCIDO';
-      const topLevelProductName = z.nombre || 'PRODUCTO';
+      const agentCode = String(z.codigo_agente || '0').trim();
+      const agentName = String(z.nombre_agente || z.nombre_comercial || 'DESCONOCIDO').toUpperCase();
 
       if (z.productos && Array.isArray(z.productos)) {
         for (const p of z.productos) {
+          const prodCode = String(p.codigo || '').trim().toUpperCase();
+          const prodName = String(p.nombre_producto || '').trim().toUpperCase();
           
-          let rawProductCode = String(p.codigo || 'UNKNOWN').toUpperCase();
-          rawProductCode = rawProductCode.replace(/^#/, '').replace(/\s+/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+          if (!prodCode) continue;
+
+          // TRUNCADO Y MULTIPLICACIÓN
+          const rawQtyStr = String(p.cantidad || 0).replace(',', '.');
+          const boxesReceived = Math.floor(Number(rawQtyStr) || 0);
           
-          const finalProductName = p.nombre || topLevelProductName;
-          let rawQtyBoxes = Math.floor(Number(p.cantidad) || 0);
-          
-          const recordKey = `${agentCode}-${rawProductCode}-${todayStr}`;
-          lastCode = rawProductCode;
+          const packSize = PRODUCT_PACK_SIZE[prodCode] || 1;
+          const finalUnits = boxesReceived * packSize;
 
-          // LOGICA SEGURA V5.0
-          if (rawQtyBoxes > 0) {
-            // CASO A: Insertar o Actualizar (Cantidad > 0)
-            const packSize = PRODUCT_PACK_SIZE[rawProductCode] || 1;
-            const finalQtyUnits = rawQtyBoxes * packSize;
+          const recordKey = `${agentCode}-${prodCode}-${todayStr}`;
+          lastCode = prodCode;
 
-            const result = await client.query(
-              `INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity, record_key) 
-               VALUES ($1, $2, $3, $4, $5, $6)
-               ON CONFLICT (record_key) 
-               DO UPDATE SET 
-                  quantity = EXCLUDED.quantity,
-                  product_name = EXCLUDED.product_name,
-                  received_at = CURRENT_TIMESTAMP
-               RETURNING (xmax = 0) AS inserted`, 
-              [agentCode, agentName, rawProductCode, finalProductName, finalQtyUnits, recordKey]
-            );
+          if (finalUnits > 0) {
+            // Reflejamos en Postgres el total real de unidades
+            await client.query(`
+              INSERT INTO orders (agent_code, agent_name, product_code, product_name, quantity, record_key)
+              VALUES ($1, $2, $3, $4, $5, $6)
+              ON CONFLICT (record_key)
+              DO UPDATE SET 
+                quantity = orders.quantity + EXCLUDED.quantity,
+                product_name = EXCLUDED.product_name,
+                received_at = CURRENT_TIMESTAMP
+            `, [agentCode, agentName, prodCode, prodName, finalUnits, recordKey]);
+          }
 
-            if (result.rows[0].inserted) {
-              countInsert++;
-            } else {
-              countUpdated++;
-            }
-
-          } else {
-            // CASO B: Borrado Explícito (Cantidad es 0)
-            // Si llega cantidad 0, asumimos que se quiere eliminar la línea
-            const deleteResult = await client.query(
-              `DELETE FROM orders WHERE record_key = $1`,
-              [recordKey]
-            );
-            if (deleteResult.rowCount > 0) {
-               countDeleted++;
-               console.log(`🗑️ [DELETE] Línea eliminada explícitamente (Qty=0): ${recordKey}`);
-            }
+          if (p.stock_fisico !== undefined) {
+             const rawStockStr = String(p.stock_fisico).replace(',', '.');
+             const stockVal = Number(rawStockStr) || 0;
+             await client.query(`
+               INSERT INTO inventory (product_code, stock_qty)
+               VALUES ($1, $2)
+               ON CONFLICT (product_code) DO UPDATE SET stock_qty = EXCLUDED.stock_qty
+             `, [prodCode, stockVal]);
           }
         }
       }
     }
-
-    // HEMOS ELIMINADO EL BLOQUE DE "CLEANUP" MASIVO AQUÍ
-    // Para evitar borrar datos válidos si el webhook llega fragmentado.
-
     await client.query('COMMIT');
-    console.log(`✅ [SYNC] Procesado. Nuevos: ${countInsert} | Actualizados: ${countUpdated} | Eliminados: ${countDeleted}`);
-    
     notifyClients(lastCode, 'order');
-    res.json({ ok: true, inserted: countInsert, updated: countUpdated, deleted: countDeleted });
-
+    res.json({ ok: true, status: 'multiplied_and_stored' });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('❌ [ERROR]', err.message);
-    res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-app.post('/api/scan', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || authHeader !== 'Bearer DASHBOARD_V4_KEY_2026') {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const { codigo, cantidad } = req.body;
-  if (!codigo || !cantidad) {
-    return res.status(400).json({ error: 'Faltan datos' });
-  }
-
-  const client = await pool.connect();
-  try {
-    const qtyNum = Number(cantidad);
-    let codeStr = String(codigo).toUpperCase().replace(/^#/, '').replace(/\s+/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '');
-
-    await client.query(
-      `INSERT INTO inventory (product_code, stock_qty) 
-       VALUES ($1, $2)
-       ON CONFLICT (product_code) 
-       DO UPDATE SET stock_qty = inventory.stock_qty + $2`,
-      [codeStr, qtyNum]
-    );
-
-    console.log(`✅ [SCAN] ${codeStr} +${qtyNum}`);
-    notifyClients(codeStr, 'scan');
-    res.json({ ok: true, updated: codeStr, qty: qtyNum });
-  } catch (err) {
+    console.error('Webhook Error:', err);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
@@ -269,100 +136,35 @@ app.post('/api/scan', async (req, res) => {
 });
 
 app.get('/api/data', async (req, res) => {
-  if (!process.env.DATABASE_URL) return res.json([]);
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  
   try {
     const result = await pool.query(`
-      WITH RankedDates AS (
-        SELECT DISTINCT received_at::DATE as r_date
-        FROM orders
-        ORDER BY r_date DESC
-        LIMIT 2
-      ),
-      TargetDates AS (
-        SELECT 
-          (SELECT r_date FROM RankedDates OFFSET 0 LIMIT 1) as date_today,
-          (SELECT r_date FROM RankedDates OFFSET 1 LIMIT 1) as date_yesterday
-      )
       SELECT 
-        o.agent_code, 
-        o.agent_name, 
-        o.product_code, 
-        o.product_name, 
-        SUM(CASE WHEN o.received_at::DATE = (SELECT date_today FROM TargetDates) THEN o.quantity ELSE 0 END) as total_qty,
-        SUM(CASE WHEN o.received_at::DATE = (SELECT date_yesterday FROM TargetDates) THEN o.quantity ELSE 0 END) as yesterday_qty,
+        o.agent_code, o.agent_name, o.product_code, o.product_name, 
+        SUM(o.quantity) as total_qty,
         COALESCE(MAX(i.stock_qty), 0) as global_stock
       FROM orders o
       LEFT JOIN inventory i ON o.product_code = i.product_code
-      WHERE o.received_at::DATE IN (SELECT r_date FROM RankedDates)
+      WHERE o.received_at::DATE = CURRENT_DATE
       GROUP BY o.agent_code, o.agent_name, o.product_code, o.product_name
-      ORDER BY o.agent_code ASC
+      HAVING SUM(o.quantity) > 0
+      ORDER BY o.agent_code ASC, o.product_name ASC
     `);
-    
     res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Database query failed' });
-  }
-});
-
-app.get('/api/history', async (req, res) => {
-  if (!process.env.DATABASE_URL) return res.json([]);
-  const { period } = req.query; 
-  let truncType = 'week', limit = 4, interval = '1 month';
-
-  switch (period) {
-    case 'week': truncType = 'week'; limit = 5; interval = '2 month'; break;
-    case 'month': truncType = 'month'; limit = 12; interval = '1 year'; break;
-    case 'quarter': truncType = 'quarter'; limit = 5; interval = '2 year'; break;
-    case 'year': truncType = 'year'; limit = 5; interval = '5 year'; break;
-    default: truncType = 'week'; limit = 5; interval = '2 month';
-  }
-
-  try {
-    const query = `
-      SELECT 
-        DATE_TRUNC($1, received_at) as date_period,
-        SUM(quantity) as total_qty
-      FROM orders 
-      WHERE received_at >= NOW() - $2::INTERVAL
-      GROUP BY date_period
-      ORDER BY date_period ASC
-      LIMIT $3
-    `;
-    const result = await pool.query(query, [truncType, interval, limit]);
-    const formatted = result.rows.map(row => {
-      const d = new Date(row.date_period);
-      let label = period === 'month' ? d.toLocaleDateString('es-ES', { month: 'short' }).toUpperCase() : d.getFullYear().toString();
-      return { date: label, fullDate: row.date_period, produccion: Number(row.total_qty) };
-    });
-    res.json(formatted);
-  } catch (err) {
-    res.status(500).json({ error: 'History query failed' });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/reset', async (req, res) => {
-  if (!process.env.DATABASE_URL) return res.json({ ok: true });
   const client = await pool.connect();
   try {
-    // TRUNCATE RESTART IDENTITY borra todo y resetea contadores
     await client.query('TRUNCATE TABLE orders, inventory RESTART IDENTITY CASCADE');
-    console.log('⚠️ [RESET] SYSTEM FACTORY RESET EXECUTED');
     notifyClients('RESET');
     res.json({ ok: true });
-  } catch (err) { 
-    res.status(500).json({ error: err.message }); 
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, 'dist')));
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-  });
+  app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'index.html')));
 }
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Servidor de Producción activo en puerto ${PORT}`));
