@@ -1,13 +1,11 @@
 
 import React, { useMemo, useState, useEffect } from 'react';
-import { TrendBadge } from './TrendBadge';
 import { Product, VisualSettings } from '../types';
 
 interface ClientColumnProps {
   group: {
     name: string;
     products: Product[];
-    trend?: number; 
   };
   darkMode: boolean;
   settings: VisualSettings;
@@ -15,19 +13,20 @@ interface ClientColumnProps {
 }
 
 export const ClientColumn: React.FC<ClientColumnProps> = ({ group, darkMode, settings, highlightedCode }) => {
-  // Solo mostramos productos con pendiente > 0, o que acaban de terminar (delay)
   const [completedCodes, setCompletedCodes] = useState<Set<string>>(new Set());
 
   const visibleProducts = useMemo(() => {
     return group.products.filter(p => {
       const pending = Math.max(0, p.qty - p.stock);
-      // Si ya estaba marcado como completado, lo dejamos un poco más para la animación
       if (pending <= 0) {
         if (!completedCodes.has(p.code)) {
-            // Iniciar proceso de desaparición
-            setTimeout(() => {
-                setCompletedCodes(prev => new Set(prev).add(p.code));
-            }, 3000); // 3 segundos de gracia antes de desaparecer
+          setTimeout(() => {
+            setCompletedCodes(prev => {
+              const next = new Set(prev);
+              next.add(p.code);
+              return next;
+            });
+          }, 3000);
         }
         return !completedCodes.has(p.code);
       }
@@ -64,8 +63,8 @@ export const ClientColumn: React.FC<ClientColumnProps> = ({ group, darkMode, set
           <div key={colIdx} className={`flex-1 border-r last:border-r-0 flex flex-col ${darkMode ? 'border-white/5' : 'border-slate-200'}`}>
             <div className={`grid ${gridTemplate} px-4 border-b gap-2 py-2 ${darkMode ? 'border-white/10 bg-white/2' : 'border-slate-200 bg-slate-50'}`}>
               <span className="text-[9px] font-black opacity-30 uppercase tracking-widest">PRODUCTO</span>
-              <span className="text-right text-[9px] font-black opacity-30 uppercase tracking-widest">STOCK</span>
-              <span className="text-right text-[9px] font-black opacity-30 uppercase tracking-widest">FALTA</span>
+              <span className="text-right text-[9px] font-black opacity-30 uppercase tracking-widest text-blue-500">STOCK</span>
+              <span className="text-right text-[9px] font-black opacity-30 uppercase tracking-widest text-orange-500">FALTA</span>
               <span className="text-right text-[9px] font-black uppercase text-red-600 tracking-widest">TOTAL</span>
             </div>
             
@@ -79,21 +78,19 @@ export const ClientColumn: React.FC<ClientColumnProps> = ({ group, darkMode, set
                   <div 
                       key={pIdx} 
                       className={`grid ${gridTemplate} px-4 border-b items-center gap-2 transition-all duration-700 
-                        ${isDone ? 'bg-green-500/10 opacity-50' : ''}
-                        ${isHigh ? 'bg-green-600 text-white z-20 scale-[1.02] shadow-xl' : (darkMode ? 'border-white/5 hover:bg-white/5' : 'border-slate-100 hover:bg-slate-50')}
+                        ${isDone ? 'bg-green-500/10' : ''}
+                        ${isHigh ? 'bg-green-600 text-white z-20 scale-[1.01] shadow-lg' : (darkMode ? 'border-white/5 hover:bg-white/5' : 'border-slate-100 hover:bg-slate-50')}
                       `}
                       style={{ paddingTop: `${settings.rowVerticalPadding}px`, paddingBottom: `${settings.rowVerticalPadding}px` }}
                   >
                     <div className="flex flex-col min-w-0 leading-tight">
                        {showCode && (
-                        <div className="flex items-center gap-2">
                           <span className={`font-black uppercase truncate ${isHigh ? 'text-white' : (darkMode ? 'text-white' : 'text-slate-800')}`} style={{ fontSize: `${settings.codeFontSize}px` }}>
                             #{p.code}
                           </span>
-                        </div>
                        )}
                        {showName && (
-                        <span className={`font-bold uppercase truncate ${!showCode ? 'mt-0' : 'mt-1'} ${isHigh ? 'text-white/80' : (darkMode ? 'text-white/30' : 'text-slate-400')}`} style={{ fontSize: `${settings.nameFontSize}px` }}>
+                        <span className={`font-bold uppercase truncate mt-0.5 ${isHigh ? 'text-white/80' : (darkMode ? 'text-white/30' : 'text-slate-400')}`} style={{ fontSize: `${settings.nameFontSize}px` }}>
                            {p.name || 'S/N'}
                         </span>
                        )}
@@ -105,7 +102,7 @@ export const ClientColumn: React.FC<ClientColumnProps> = ({ group, darkMode, set
                     <div className={`text-right font-black text-sm tabular-nums ${isHigh ? 'text-white' : (isDone ? 'text-green-500' : 'text-orange-500')}`}>
                       {isDone ? '✓' : Math.floor(pending)}
                     </div>
-                    <div className={`text-right font-black tabular-nums ${isHigh ? 'text-white' : (darkMode ? 'text-white' : 'text-slate-900')}`} style={{ fontSize: '1.5rem' }}>
+                    <div className={`text-right font-black tabular-nums ${isHigh ? 'text-white' : (darkMode ? 'text-white' : 'text-slate-900')}`} style={{ fontSize: '1.4rem' }}>
                       {Math.floor(p.qty)}
                     </div>
                   </div>

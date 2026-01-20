@@ -5,11 +5,14 @@ import { ClientColumn } from './components/ClientColumn';
 import { StatsDashboard } from './components/StatsDashboard';
 import { SettingsModal } from './components/SettingsModal';
 import { DEFAULT_SETTINGS, CLIENT_MAPPING } from './types';
+import { AlertCircle, RefreshCw } from 'lucide-react';
 
 export default function App() {
   const [view, setView] = useState<'live' | 'stats'>('live');
   const [darkMode, setDarkMode] = useState(false);
   const [data, setData] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [highlightedCode, setHighlightedCode] = useState<string | null>(null);
   
@@ -25,6 +28,7 @@ export default function App() {
   const fetchData = useCallback(async () => {
     try {
       const res = await fetch('/api/data', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`Status ${res.status}`);
       const raw = await res.json();
       
       const groups: Record<string, any> = {};
@@ -54,23 +58,30 @@ export default function App() {
       });
 
       setData(sorted);
-    } catch (e) {}
+      setError(null);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => {
     fetchData();
     const es = new EventSource('/api/events');
+    
     es.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        fetchData(); // Refrescar datos ante cualquier cambio
-        if (msg.code) {
+        fetchData();
+        if (msg.code && msg.code !== 'RESET') {
           setHighlightedCode(msg.code);
-          setTimeout(() => setHighlightedCode(null), 3000);
+          setTimeout(() => setHighlightedCode(null), 3500);
         }
       } catch(err) {}
     };
-    const interval = setInterval(fetchData, 60000);
+
+    const interval = setInterval(fetchData, 15000);
     return () => { es.close(); clearInterval(interval); };
   }, [fetchData]);
 
@@ -87,10 +98,24 @@ export default function App() {
         total={globalTotal} settings={settings}
       />
       <main className="flex-1 relative overflow-hidden">
+        {error && (
+          <div className="absolute top-0 w-full bg-red-600 text-white p-2 text-center text-[10px] font-black uppercase z-50">
+            Error de conexión: {error}
+          </div>
+        )}
+
         {view === 'live' ? (
-          <div className="absolute inset-0 flex overflow-x-auto items-start custom-scroll px-2">
-            {data.length === 0 ? (
-              <div className="w-full h-full flex items-center justify-center opacity-20 font-black text-4xl italic uppercase tracking-widest">Sincronizando...</div>
+          <div className="absolute inset-0 flex overflow-x-auto items-start custom-scroll px-2 py-4">
+            {loading ? (
+              <div className="w-full h-full flex flex-col items-center justify-center gap-4 opacity-40">
+                <RefreshCw size={48} className="animate-spin text-red-600" />
+                <span className="font-black text-xl uppercase italic tracking-widest">Sincronizando...</span>
+              </div>
+            ) : data.length === 0 ? (
+              <div className="w-full h-full flex flex-col items-center justify-center gap-4 opacity-20">
+                <span className="font-black text-4xl uppercase italic tracking-widest text-center">Esperando pedidos<br/>de hoy</span>
+                <p className="text-xs font-bold uppercase tracking-widest">Ejecuta el escenario de Make para comenzar</p>
+              </div>
             ) : (
               data.map((client) => (
                 <ClientColumn 
