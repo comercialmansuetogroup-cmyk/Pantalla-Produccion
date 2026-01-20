@@ -12,7 +12,6 @@ export default function App() {
   const [data, setData] = useState<any[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [highlightedCode, setHighlightedCode] = useState<string | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
   const [settings, setSettings] = useState<any>(() => {
     try {
@@ -26,7 +25,6 @@ export default function App() {
   const fetchData = useCallback(async () => {
     try {
       const res = await fetch('/api/data', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`API Error: ${res.status}`);
       const raw = await res.json();
       
       const groups: Record<string, any> = {};
@@ -44,13 +42,11 @@ export default function App() {
             code: row.product_code,
             name: row.product_name,
             qty: Number(row.total_qty),
-            stock: Number(row.global_stock),
-            trend: 0 
+            stock: Number(row.global_stock)
           });
         });
       }
 
-      // Ordenar: Gran Canaria primero, luego alfabético
       const sorted = Object.values(groups).sort((a,b) => {
         if(a.name === 'GRAN CANARIA') return -1;
         if(b.name === 'GRAN CANARIA') return 1;
@@ -58,10 +54,7 @@ export default function App() {
       });
 
       setData(sorted);
-      setErrorMsg(null);
-    } catch (e: any) { 
-      setErrorMsg(e.message);
-    }
+    } catch (e) {}
   }, []);
 
   useEffect(() => {
@@ -70,14 +63,14 @@ export default function App() {
     es.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        fetchData();
+        fetchData(); // Refrescar datos ante cualquier cambio
         if (msg.code) {
           setHighlightedCode(msg.code);
           setTimeout(() => setHighlightedCode(null), 3000);
         }
       } catch(err) {}
     };
-    const interval = setInterval(fetchData, 30000);
+    const interval = setInterval(fetchData, 60000);
     return () => { es.close(); clearInterval(interval); };
   }, [fetchData]);
 
@@ -94,18 +87,30 @@ export default function App() {
         total={globalTotal} settings={settings}
       />
       <main className="flex-1 relative overflow-hidden">
-        {errorMsg && <div className="absolute top-0 w-full bg-red-600 text-white text-[10px] py-1 text-center z-50 uppercase font-black">{errorMsg}</div>}
         {view === 'live' ? (
-          <div className="absolute inset-0 flex overflow-x-auto items-start custom-scroll">
+          <div className="absolute inset-0 flex overflow-x-auto items-start custom-scroll px-2">
             {data.length === 0 ? (
-              <div className="w-full h-full flex items-center justify-center opacity-20 font-black text-4xl italic uppercase tracking-widest">Esperando Datos...</div>
+              <div className="w-full h-full flex items-center justify-center opacity-20 font-black text-4xl italic uppercase tracking-widest">Sincronizando...</div>
             ) : (
-              data.map((client) => <ClientColumn key={client.name} group={client} darkMode={darkMode} settings={settings} highlightedCode={highlightedCode} />)
+              data.map((client) => (
+                <ClientColumn 
+                  key={client.name} 
+                  group={client} 
+                  darkMode={darkMode} 
+                  settings={settings} 
+                  highlightedCode={highlightedCode} 
+                />
+              ))
             )}
           </div>
         ) : <StatsDashboard darkMode={darkMode} data={data} />}
       </main>
-      <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} visualSettings={settings} onSaveSettings={(s) => { setSettings(s); localStorage.setItem('factory_settings_v20', JSON.stringify(s)); }} />
+      <SettingsModal 
+        isOpen={isSettingsOpen} 
+        onClose={() => setIsSettingsOpen(false)} 
+        visualSettings={settings} 
+        onSaveSettings={(s) => { setSettings(s); localStorage.setItem('factory_settings_v20', JSON.stringify(s)); }} 
+      />
     </div>
   );
 }
